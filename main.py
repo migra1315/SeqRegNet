@@ -23,12 +23,11 @@ def main(args):
     data_folder = f'/data/JY/Dirlab/case{case}/'
     landmark_file = f'/data/JY/Dirlab/case{case}/Case{case}_300_00_50.pt'
     states_folder = 'result_tmp'
-
     config = dict(
         train=not args.test, load=args.load, scale=args.scale, max_num_iteration=args.max_num_iteration,
         dim=3, learning_rate=args.lr, apex=args.apex, initial_channels=args.initial_channels, depth=4,
         normalization=True, smooth_reg=1e-3, cyclic_reg=1e-2, ncc_window_size=5, load_optimizer=False,
-        group_index_list=[0, 1, 2, 3, 4, 5], fixed_disp_indexes=5, pair_disp_indexes=[0, 5],
+        group_index_list=[0, 1, 3, 5, 7, 9], fixed_disp_indexes=3, pair_disp_indexes=[0, 3],
         pair_disp_calc_interval=50, stop_std=0.0007, stop_query_len=100,
         device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
     )
@@ -136,7 +135,7 @@ def main(args):
         regnet.eval()
         with torch.no_grad():
             res = Forward(input_image)
-            Sample(input_image, config.load[:-4], 'test')
+            # Sample(input_image, config.load[:-4], 'test')
             if args.group:
                 mean, std, diff = regnet.calcdisp.cal_tre(res, config, grid_tuple, landmark_00_converted, landmark_disp,
                                                           pixel_spacing)
@@ -152,7 +151,7 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Search some files')
     parser.add_argument('--scale', type=float, default=0.5, help='help')
-    parser.add_argument('--lr', type=float, default=1e-2, help='help')
+    parser.add_argument('--lr', type=float, default=1e-3, help='help')
     parser.add_argument('-max', '--max_num_iteration', type=int, default=3000, help='help')
     parser.add_argument('-case', '--case_num', type=int, default=1, help='help')
     parser.add_argument('-channel', '--initial_channels', type=int, default=30, help='help')

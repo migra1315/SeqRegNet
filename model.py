@@ -286,6 +286,80 @@ class Ulstm(nn.Module):
         return disp
 
 
+class UlstmCatSkipConnect(nn.Module):
+    def __init__(self):
+        super(UlstmCatSkipConnect, self).__init__()
+        self.down_conv = ConvBlock(in_channels=1, out_channels=16,
+                                   kernel_size=(3, 3, 3), padding=1, bias=True)
+        self.down_1 = ConvLSTM(input_dim=16, hidden_dim=32, kernel_size=(3, 3, 3))
+        self.down_2 = ConvLSTM(input_dim=32, hidden_dim=64, kernel_size=(3, 3, 3))
+        self.down_3 = ConvLSTM(input_dim=64, hidden_dim=128, kernel_size=(3, 3, 3))
+
+        self.up_3 = ConvLSTM(input_dim=128, hidden_dim=64, kernel_size=(3, 3, 3))
+
+        self.up_20 = ConvLSTM(input_dim=128, hidden_dim=64, kernel_size=(3, 3, 3))
+        self.up_21 = ConvLSTM(input_dim=64, hidden_dim=32, kernel_size=(3, 3, 3))
+
+        self.up_10 = ConvLSTM(input_dim=64, hidden_dim=32, kernel_size=(3, 3, 3))
+        self.up_11 = ConvLSTM(input_dim=32, hidden_dim=16, kernel_size=(3, 3, 3))
+
+        self.up_conv = nn.Conv3d(in_channels=16, out_channels=3, kernel_size=(3, 3, 3), padding=1)
+        self.attn_1 = Attn(in_channels=64, out_channels=64)
+        self.attn_2 = Attn(in_channels=32, out_channels=32)
+
+    def forward(self, x):
+        embedding_list = []
+        # 需求input [10, 1, 48, 128, 128]
+        seq_len = x.size()[0]
+        image_shape = x.size()[2:]
+        for index in range(seq_len):
+            embedding = self.down_conv(x[index:index + 1, :])
+            embedding_list.append(embedding)
+        embedding = torch.stack(embedding_list, dim=1)
+        del embedding_list
+
+        down_list = []
+        x = self.down_1(embedding)
+        del embedding
+        x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
+                          recompute_scale_factor=False)
+        down_list.append(x)
+        x = self.down_2(x.unsqueeze(0))
+        x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
+                          recompute_scale_factor=False)
+        down_list.append(x)
+        x = self.down_3(x.unsqueeze(0))
+        x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
+                          recompute_scale_factor=False)
+
+        x = self.up_3(x.unsqueeze(0))
+        x = F.interpolate(x.squeeze(0), size=down_list[1].size()[2:], mode='trilinear', align_corners=True,
+                          recompute_scale_factor=False)
+
+        x = torch.cat((x, down_list[1]), dim=1)
+        x = self.up_20(x.unsqueeze(0))
+        x = self.up_21(x)
+        x = F.interpolate(x.squeeze(0), size=down_list[0].size()[2:], mode='trilinear', align_corners=True,
+                          recompute_scale_factor=False)
+
+        x = torch.cat((x, down_list[0]), dim=1)
+        x = self.up_10(x.unsqueeze(0))
+        x = self.up_11(x)
+        x = F.interpolate(x.squeeze(0), scale_factor=2, mode='trilinear', align_corners=True,
+                          recompute_scale_factor=False)
+
+        disp_list = []
+        for index in range(seq_len):
+            disp = self.up_conv(x[index:index + 1, :])
+            disp_list.append(disp)
+        disp = torch.stack(disp_list, dim=1).squeeze(0)
+        del x
+        del disp_list
+        disp = F.interpolate(disp, size=image_shape, mode='trilinear', align_corners=True,
+                             recompute_scale_factor=False)
+        return disp
+
+
 class SpatialTransformer(nn.Module):
     # 2D or 3d spatial transformer network to calculate the warped moving image
 
@@ -345,6 +419,7 @@ class RegNet(nn.Module):
         self.scale = scale
         self.config = config
         self.unet = Ulstm()
+        # self.unet = UlstmCatSkipConnect()
         self.spatial_transform = SpatialTransformer(self.dim)
         self.ncc_loss = loss.NCC(self.config.dim, self.config.ncc_window_size)
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config.learning_rate, eps=1e-3)
@@ -559,6 +634,10 @@ class RegNet(nn.Module):
             states = torch.load(state_file, map_location=self.config.device)
             #     iter = len(states['loss_list'])
             self.load_state_dict(states['model'])
+            print(f'load model and optimizer state {self.config.load}')
+        else:
+            print(f'{self.config.load} doesn\'t exist')
+
             #     if self.config.load_optimizer:
             #         self.optimizer.load_state_dict(states['optimizer'])
             #         logging.info(f'load model and optimizer state {self.config.load} from iter {iter}')
