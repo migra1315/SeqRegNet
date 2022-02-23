@@ -48,7 +48,6 @@ def main(args):
 
     if args.apex:
         regnet, regnet.optimizer = amp.initialize(regnet, regnet.optimizer, opt_level="O1")
-
     pbar = tqdm.tqdm(range(config.max_num_iteration))
     for epoch in pbar:
         for it, input_image in enumerate(loader):
