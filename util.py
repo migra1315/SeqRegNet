@@ -311,7 +311,7 @@ def load_data_for_dataset(data_folder):
 def get_img_path_list(data_folder):
     list = []
     for file_name in os.listdir(data_folder):
-        list.append(os.path.join(data_folder,file_name))
+        list.append(os.path.join(data_folder, file_name))
     return list
 
 
@@ -324,7 +324,6 @@ class SeqDataSet(data.Dataset):
         ImgPath = self.ImgPathList[index]
         InputImg = self.loader(ImgPath)
         return InputImg
-
 
     def __len__(self):
         return len(self.ImgPathList)
