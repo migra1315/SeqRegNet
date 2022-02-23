@@ -411,6 +411,11 @@ class SpatialTransformer(nn.Module):
 
 class RegNet(nn.Module):
 
+    """
+    提供了两种训练模式
+    1. forward：生成从template向图像序列配准的形变场
+    2. pairwise_forward：生成从增维的T00向图像序列配准的形变场
+    """
     def __init__(self, dim=3, n=6, config=None, scale=0.5):
         super().__init__()
         assert dim in (2, 3)
@@ -424,7 +429,6 @@ class RegNet(nn.Module):
         self.ncc_loss = loss.NCC(self.config.dim, self.config.ncc_window_size)
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config.learning_rate, eps=1e-3)
         self.calcdisp = util.CalcDisp(dim=self.config.dim, calc_device=config.device)
-        # self.scaler = GradScaler()
         self.description()
 
     def forward(self, input_image):
@@ -568,23 +572,6 @@ class RegNet(nn.Module):
 
     def pairwise_update(self, input_image):
         self.optimizer.zero_grad()
-        # -----混合精度-----#
-        # with autocast():
-        #     res = self.pairwise_forward(input_image)
-        #     total_loss = 0.
-        #     simi_loss = self.ncc_loss(res['warped_input_image'], input_image)
-        #     total_loss += simi_loss
-        #     if self.config.smooth_reg > 0:
-        #         smooth_loss = loss.smooth_loss(res['scaled_disp_t2i'], res['scaled_warped_input_image'])
-        #         total_loss += self.config.smooth_reg * smooth_loss
-        #         smooth_loss_item = smooth_loss.item()
-        #     else:
-        #         smooth_loss_item = 0
-        #
-        # self.scaler.scale(total_loss).backward()
-        # self.scaler.step(self.optimizer)
-        # self.scaler.update()
-        # -----混合精度-----#
         res = self.pairwise_forward(input_image)
         total_loss = 0.
         simi_loss = self.ncc_loss(res['warped_input_image'], input_image)
@@ -637,15 +624,6 @@ class RegNet(nn.Module):
             print(f'load model and optimizer state {self.config.load}')
         else:
             print(f'{self.config.load} doesn\'t exist')
-
-            #     if self.config.load_optimizer:
-            #         self.optimizer.load_state_dict(states['optimizer'])
-            #         logging.info(f'load model and optimizer state {self.config.load} from iter {iter}')
-            #     else:
-            #         logging.info(f'load model state {self.config.load} from iter {iter}')
-            #     return iter
-            # else:
-            #     logging.info(f'{state_file}doesn\'t exist')
             return 0
 
     def description(self):

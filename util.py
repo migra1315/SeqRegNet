@@ -300,7 +300,7 @@ def load_data_for_dataset(data_folder):
     image_file_list = sorted([file_name for file_name in os.listdir(data_folder) if file_name.lower().endswith('.nii')])[0:6]
     assert image_file_list != None , f'the target file {data_folder} is empty!'
     image_list = []
-    image_list = [sitk.GetArrayFromImage(sitk.ReadImage(os.path.join(data_folder, file_name))) for file_name in
+    image_list = [np.flip(sitk.GetArrayFromImage(sitk.ReadImage(os.path.join(data_folder, file_name))), 0) for file_name in
                   image_file_list]
     input_image = torch.stack([torch.from_numpy(image)[None] for image in image_list], 0)
     input_image = (input_image - input_image.min()) / (input_image.max() - input_image.min())
