@@ -25,7 +25,8 @@ def train(args):
     device = torch.device("cuda", local_rank)
     gpu_num = torch.cuda.device_count()
 
-    data_folder = '/data/JY/PKUH3_new/'
+    # data_folder = '/data/JY/PKUH3_new/'
+    data_folder='F:\\DataSet\\PKUH3\\4_npy_for_seq'
     states_folder = 'result_train'
 
     config = dict(
