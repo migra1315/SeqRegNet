@@ -58,7 +58,7 @@ def main(args):
         [crop_range[0].start, crop_range[1].start, crop_range[2].start], dtype=np.float32)
 
     # 初始化训练模型
-    regnet = Model(dim=config.dim, n=len(config.group_index_list), config=config, scale=config.scale)
+    regnet = Model(dim=config.dim, seq_len=len(config.group_index_list), config=config, scale=config.scale)
 
     regnet = regnet.to(config.device)
     input_image = input_image.to(config.device)

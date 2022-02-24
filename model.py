@@ -235,7 +235,7 @@ class Ulstm(nn.Module):
 
     def forward(self, x):
         embedding_list = []
-        # 需求input [10, 1, 48, 128, 128]
+        # 需求input [n, 1, 48, 128, 128]
         seq_len = x.size()[0]
         image_shape = x.size()[2:]
         for index in range(seq_len):
@@ -416,15 +416,15 @@ class RegNet(nn.Module):
     1. forward：生成从template向图像序列配准的形变场
     2. pairwise_forward：生成从增维的T00向图像序列配准的形变场
     """
-    def __init__(self, dim=3, n=6, config=None, scale=0.5):
+    def __init__(self, dim=3, seq_len=6, config=None, scale=0.5):
         super().__init__()
         assert dim in (2, 3)
         self.dim = dim
-        self.n = n
+        self.seq_len = seq_len
         self.scale = scale
         self.config = config
-        self.unet = Ulstm()
-        # self.unet = UlstmCatSkipConnect()
+        # self.unet = Ulstm()
+        self.unet = UlstmCatSkipConnect()
         self.spatial_transform = SpatialTransformer(self.dim)
         self.ncc_loss = loss.NCC(self.config.dim, self.config.ncc_window_size)
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config.learning_rate, eps=1e-3)
@@ -553,7 +553,7 @@ class RegNet(nn.Module):
             disp_t2i = scaled_disp_t2i
         # disp_t2i: [6, 3, 96, 256, 256]
 
-        moving_image = input_image[0:1, :, :, :, :].repeat(self.n, 1, 1, 1, 1)
+        moving_image = input_image[0:1, :, :, :, :].repeat(self.seq_len, 1, 1, 1, 1)
 
         warped_input_image = self.spatial_transform(moving_image, disp_t2i)
         # [6, 1, 96, 256, 256] @ [6, 3, 96, 256, 256] = [6, 1, 96, 256, 256]
@@ -595,8 +595,15 @@ class RegNet(nn.Module):
     def pairwise_sample(self, input_image, path, iter):
         with torch.no_grad():
             res = self.pairwise_forward(input_image)
+
+            for index in range(input_image.size()[0]):
+                arr = input_image[index, :, :, :, :].detach().squeeze(0).cpu().numpy()
+                vol = sitk.GetImageFromArray(arr)
+                vol.SetSpacing([0.976, 0.976, 2.5])
+                sitk.WriteImage(vol, os.path.join(path, f'input_{iter}_{index}.nii'))
+
             for index in range(res['warped_input_image'].size()[0]):
-                arr = (res['warped_input_image']-input_image)[index, :, :, :, :].detach().squeeze(0).cpu().numpy()
+                arr = input_image[index, :, :, :, :].detach().squeeze(0).cpu().numpy()
                 vol = sitk.GetImageFromArray(arr)
                 vol.SetSpacing([0.976, 0.976, 2.5])
                 sitk.WriteImage(vol, os.path.join(path, f'warp_{iter}_{index}.nii'))

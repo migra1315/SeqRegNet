@@ -305,7 +305,7 @@ def load_data_for_dataset(path):
     # input_image = torch.stack([torch.from_numpy(image)[None] for image in image_list], 0)
     # input_image = (input_image - input_image.min()) / (input_image.max() - input_image.min())
     # input_image = input_image.squeeze(1)
-    image = np.load(path)
+    image = np.load(path).astype('float32')
     image = torch.from_numpy(image)
     return image
 
