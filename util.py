@@ -172,6 +172,14 @@ class CalTRE():
 
     def cal_disp(self, landmark_moving, landmark_fixed, spacing):
         diff_list = []
+        print(landmark_moving[1].size)
+        print(landmark_moving[1])
+        print(landmark_fixed[1])
+        gt = np.flip((landmark_fixed[1] - landmark_moving[1]), 0)  # 对应的方向分别为[240,157,83]
+        print(gt)
+        pred = self.inter(landmark_moving[1])
+        print(pred)
+
         for i in range(300):
             # landmark_moving[i]处的推理形变场pred
             # landmark_moving[i]处的真实形变场gt

@@ -410,7 +410,6 @@ class SpatialTransformer(nn.Module):
 
 
 class RegNet(nn.Module):
-
     """
     提供了两种训练模式
     1. forward：生成从template向图像序列配准的形变场
@@ -567,7 +566,7 @@ class RegNet(nn.Module):
         # scaled_warped_input_image: [6, 1, 48, 128, 128]
 
         res = {'disp_t2i': disp_t2i, 'scaled_disp_t2i': scaled_disp_t2i, 'warped_input_image': warped_input_image,
-               'scaled_warped_input_image': scaled_warped_input_image}
+               'scaled_warped_input_image': scaled_warped_input_image, 'moving_image': input_image[0, :, :, :, :]}
         return res
 
     def pairwise_update(self, input_image):
@@ -576,12 +575,10 @@ class RegNet(nn.Module):
         total_loss = 0.
         simi_loss = self.ncc_loss(res['warped_input_image'], input_image)
         total_loss += simi_loss
-        if self.config.smooth_reg > 0:
-            smooth_loss = loss.smooth_loss(res['scaled_disp_t2i'], res['scaled_warped_input_image'])
-            total_loss += self.config.smooth_reg * smooth_loss
-            smooth_loss_item = smooth_loss.item()
-        else:
-            smooth_loss_item = 0
+
+        smooth_loss = loss.smooth_loss(res['scaled_disp_t2i'], res['scaled_warped_input_image'])
+        total_loss += self.config.smooth_reg * smooth_loss
+        smooth_loss_item = smooth_loss.item()
 
         if self.config.apex:
             with amp.scale_loss(total_loss, self.optimizer) as scaled_loss:
@@ -594,33 +591,39 @@ class RegNet(nn.Module):
 
     def pairwise_sample(self, input_image, path, iter):
         with torch.no_grad():
+            self.eval()
             res = self.pairwise_forward(input_image)
+            self.train()
+            # for index in [0, 5]:
+            arr_warped_image = res['warped_input_image'][-1, :, :, :, :].detach().squeeze(0).cpu().numpy()
+            vol_warped_image = sitk.GetImageFromArray(arr_warped_image)
+            vol_warped_image.SetSpacing([0.976, 0.976, 2.5])
+            sitk.WriteImage(vol_warped_image, os.path.join(path, f'warp_{iter}.nii'))
 
-            for index in range(input_image.size()[0]):
-                arr = input_image[index, :, :, :, :].detach().squeeze(0).cpu().numpy()
-                vol = sitk.GetImageFromArray(arr)
-                vol.SetSpacing([0.976, 0.976, 2.5])
-                sitk.WriteImage(vol, os.path.join(path, f'input_{iter}_{index}.nii'))
+            arr_disp = res['disp_t2i'][-1, :, :, :, :].detach().squeeze(0).permute(1, 2, 3, 0).cpu().numpy()
+            vol_disp = sitk.GetImageFromArray(arr_disp)
+            vol_disp.SetSpacing([0.976, 0.976, 2.5])
+            sitk.WriteImage(vol_disp, os.path.join(path, f'disp_{iter}.nii'))
 
-            for index in range(res['warped_input_image'].size()[0]):
-                arr = input_image[index, :, :, :, :].detach().squeeze(0).cpu().numpy()
-                vol = sitk.GetImageFromArray(arr)
-                vol.SetSpacing([0.976, 0.976, 2.5])
-                sitk.WriteImage(vol, os.path.join(path, f'warp_{iter}_{index}.nii'))
+            arr_moving_image = res['moving_image'].detach().squeeze(0).cpu().numpy()
+            vol_moving_image = sitk.GetImageFromArray(arr_moving_image)
+            vol_moving_image.SetSpacing([0.976, 0.976, 2.5])
+            sitk.WriteImage(vol_moving_image, os.path.join(path, f'moving_{iter}.nii'))
 
-            for index in range(res['disp_t2i'].size()[0]):  # 10,3,83,157,240
-                arr = res['disp_t2i'][index, :, :, :, :].detach().squeeze(0).permute(1, 2, 3, 0).cpu().numpy()
-                vol = sitk.GetImageFromArray(arr)
-                vol.SetSpacing([0.976, 0.976, 2.5])
-                sitk.WriteImage(vol, os.path.join(path, f'disp_{iter}_{index}.nii'))
+            arr_fixed_image = input_image[-1, :, :, :, :].detach().squeeze(0).cpu().numpy()
+            vol_fixed_image = sitk.GetImageFromArray(arr_fixed_image)
+            vol_fixed_image.SetSpacing([0.976, 0.976, 2.5])
+            sitk.WriteImage(vol_fixed_image, os.path.join(path, f'fixed_{iter}.nii'))
 
     def pairwise_sample_slice(self, input_image, path, iter):
+        self.eval()
         with torch.no_grad():
             res = self.pairwise_forward(input_image)
-            for index in range(res['warped_input_image'].size()[0]):
+            for index in [0, 5]:
                 arr = res['warped_input_image'][index, :, :, :, :].detach().squeeze(0)  # 83,157,240
                 slice = arr[50, :, :]
                 vutils.save_image(slice.data, os.path.join(path, f'warp_{iter}_{index}.png'), padding=0, normalize=True)
+        self.train()
 
     def load(self):
         state_file = self.config.load

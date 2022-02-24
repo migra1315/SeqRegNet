@@ -140,8 +140,10 @@ def main(args):
                 mean, std, diff = regnet.calcdisp.cal_tre(res, config, grid_tuple, landmark_00_converted, landmark_disp,
                                                           pixel_spacing)
             else:
+                print('disp size:',res['disp_t2i'][config.fixed_disp_indexes].size())
                 calTRE = CalTRE(grid_tuple, res['disp_t2i'][config.fixed_disp_indexes])
                 mean, std, diff = calTRE.cal_disp(landmark_00_converted, landmark_50_converted, pixel_spacing)
+
             if False:
                 flow = res['disp_t2i'].detach().cpu()  # .numpy()
                 torch.save(res['disp_t2i'], 'result/disp_' + states_file + '.pth')
