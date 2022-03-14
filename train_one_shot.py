@@ -3,7 +3,7 @@ import logging
 import os
 
 import numpy as np
-# os.environ['CUDA_VISIBLE_DEVICES'] ="3"
+# os.environ['CUDA_VISIBLE_DEVICES'] = "5"
 import tensorboardX
 import torch
 import tqdm
@@ -22,7 +22,7 @@ def main(args):
     # landmark_file = f'../DataBase/Dirlab/case{case}/Case{case}_300_00_50.pt'
     data_folder = f'/data/JY/Dirlab/case{case}/'
     landmark_file = f'/data/JY/Dirlab/case{case}/Case{case}_300_00_50.pt'
-    states_folder = 'result_tmp'
+    states_folder = 'result'
     config = dict(
         train=not args.test, load=args.load, scale=args.scale, max_num_iteration=args.max_num_iteration,
         dim=3, learning_rate=args.lr, apex=args.apex, initial_channels=args.initial_channels, depth=4,
@@ -34,7 +34,7 @@ def main(args):
     config = util.Struct(**config)
 
     index = len([file for file in os.listdir(states_folder) if os.path.isdir(os.path.join(states_folder, file))])
-    model_name, Model = init_model('ulstm')
+    model_name, Model = init_model('ucr_Attn')
     states_file = model_name + f'_case{case}_{index:03d}' if not args.write_name else args.write_name + f'_case{case}_{index:03d}'
     train_writer = tensorboardX.SummaryWriter(os.path.join(states_folder, states_file)) if config.train else None
 
@@ -140,20 +140,21 @@ def main(args):
                 mean, std, diff = regnet.calcdisp.cal_tre(res, config, grid_tuple, landmark_00_converted, landmark_disp,
                                                           pixel_spacing)
             else:
-                print('disp size:',res['disp_t2i'][config.fixed_disp_indexes].size())
+                print('disp size:', res['disp_t2i'][config.fixed_disp_indexes].size())
                 calTRE = CalTRE(grid_tuple, res['disp_t2i'][config.fixed_disp_indexes])
                 mean, std, diff = calTRE.cal_disp(landmark_00_converted, landmark_50_converted, pixel_spacing)
 
-            if False:
+            if True:
                 flow = res['disp_t2i'].detach().cpu()  # .numpy()
                 torch.save(res['disp_t2i'], 'result/disp_' + states_file + '.pth')
             print(f'\ndiff: {mean:.2f}+-{std:.2f}({np.max(diff):.2f})')
+
 
 # 按间距中的绿色按钮以运行脚本。
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Search some files')
     parser.add_argument('--scale', type=float, default=0.5, help='help')
-    parser.add_argument('--lr', type=float, default=1e-3, help='help')
+    parser.add_argument('--lr', type=float, default=1e-2, help='help')
     parser.add_argument('-max', '--max_num_iteration', type=int, default=3000, help='help')
     parser.add_argument('-case', '--case_num', type=int, default=1, help='help')
     parser.add_argument('-channel', '--initial_channels', type=int, default=30, help='help')

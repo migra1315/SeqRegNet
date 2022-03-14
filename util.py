@@ -172,13 +172,8 @@ class CalTRE():
 
     def cal_disp(self, landmark_moving, landmark_fixed, spacing):
         diff_list = []
-        print(landmark_moving[1].size)
-        print(landmark_moving[1])
-        print(landmark_fixed[1])
         gt = np.flip((landmark_fixed[1] - landmark_moving[1]), 0)  # 对应的方向分别为[240,157,83]
-        print(gt)
         pred = self.inter(landmark_moving[1])
-        print(pred)
 
         for i in range(300):
             # landmark_moving[i]处的推理形变场pred
@@ -193,7 +188,11 @@ class CalTRE():
 
 
 def get_case(case_num):
-    if case_num == 1:
+    if case_num == 0:
+        case = 0
+        crop_range = [slice(0, 66), slice(170, 430), slice(50, 450)]
+        pixel_spacing = np.array([0.97, 0.97, 5], dtype=np.float32)
+    elif case_num == 1:
         case = 1
         crop_range = [slice(0, 94), slice(42, 202), slice(0, 256)]
         pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
@@ -246,7 +245,8 @@ def get_case(case_num):
 
 def load_data(data_folder, crop_range):
     # 导入数据集，尺寸: [10, 1, 94, 256, 256]/归一化/裁切
-    image_file_list = sorted([file_name for file_name in os.listdir(data_folder) if file_name.lower().endswith('mhd')])
+    image_file_list = sorted([file_name for file_name in os.listdir(data_folder) if
+                              (file_name.lower().endswith('mhd') or file_name.lower().endswith('nii'))])
     image_list = []
     image_list = [sitk.GetArrayFromImage(sitk.ReadImage(os.path.join(data_folder, file_name))) for file_name in
                   image_file_list]

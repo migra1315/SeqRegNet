@@ -109,3 +109,54 @@ def smooth_loss(disp, image):
 def mse_loss(y_true, y_pred):
     return torch.mean((y_true - y_pred) ** 2)
 
+class Get_Ja():
+
+    def loss_2D(self, displacement):
+        '''
+        input:
+            displacement:形变场,[batch,channels,L,W],如[1,2,256,256]
+        methods:
+            计算形变场的在每个体素处的雅可比行列式,当:
+                Jac>1,扩张
+                Jac=1,不变
+                0<Jac<1,收缩
+                Jac<0,折叠
+            雅可比矩阵:                                                     雅可比行列式:
+            dux/dx = ux(x+1,y)-ux(x,y)  duy/dx = ux(x+1,y)-ux(x,y)          Jac = a11*a22-a12*a21
+            dux/dy = ux(x,y+1)-ux(x,y)  duy/dy = ux(x,y+1)-ux(x,y)              = dux/dx*duy/dy-duy/dx*dux/dy
+            需要注意的事项:
+            为了与物理意义对应,即Jac=1,不变.计算雅可比矩阵时,对角线元素应加1,即:Jac= (dux/dx+1)*(duy/dy+1)-duy/dx*dux/dy
+        output:
+            D:每个体素处的雅可比行列式,[batch,L-1,W-1],如[1,255,255].参照计算梯度的方法,最后1行/列无梯度,故返回L-1,W-1
+        '''
+        D_y = (displacement[:, :, 1:, :-1] - displacement[:, :, :-1, :-1])
+        D_x = (displacement[:, :, :-1, 1:] - displacement[:, :, :-1, :-1])
+
+        D1 = (D_x[:, 0, :, :] + 1) * (D_y[:, 1, :, :] + 1)
+        D2 = D_y[:, 0, :, :] * D_x[:, 1, :, :]
+        D = D1 - D2
+        return D
+
+    def loss_3D(displacement):
+        '''
+        input:
+            displacement:[batch,channels,L,W,D],如[1,3,256,256,256]
+        methods:
+            参见2D
+        '''
+        displacement = displacement.permute(0, 2, 3, 4, 1)
+
+        D_y = (displacement[:, 1:, :-1, :-1, :] - displacement[:, :-1, :-1, :-1, :])
+        print(D_y.size())
+        D_x = (displacement[:, :-1, 1:, :-1, :] - displacement[:, :-1, :-1, :-1, :])
+        print(D_x.size())
+        D_z = (displacement[:, :-1, :-1, 1:, :] - displacement[:, :-1, :-1, :-1, :])
+        print(D_z.size())
+
+        D1 = (D_x[..., 0] + 1) * ((D_y[..., 1] + 1) * (D_z[..., 2] + 1) - D_y[..., 2] * D_z[..., 1])
+        D2 = (D_x[..., 1]) * (D_y[..., 0] * (D_z[..., 2] + 1) - D_y[..., 2] * D_z[..., 0])
+        D3 = (D_x[..., 2]) * (D_y[..., 0] * D_z[..., 1] - (D_y[..., 1] + 1) * D_z[..., 0])
+
+        D = D1 - D2 + D3
+
+        return D
