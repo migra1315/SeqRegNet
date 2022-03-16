@@ -137,21 +137,19 @@ class Get_Ja():
         D = D1 - D2
         return D
 
-    def loss_3D(displacement):
+    def loss_3D(self, displacement):
         '''
         input:
-            displacement:[batch,channels,L,W,D],如[1,3,256,256,256]
+            displacement:[batch,channels,L,W,D],如[1,3,256,256,96]
+            之后permute成1,256,256,96,3
         methods:
             参见2D
         '''
         displacement = displacement.permute(0, 2, 3, 4, 1)
 
         D_y = (displacement[:, 1:, :-1, :-1, :] - displacement[:, :-1, :-1, :-1, :])
-        print(D_y.size())
         D_x = (displacement[:, :-1, 1:, :-1, :] - displacement[:, :-1, :-1, :-1, :])
-        print(D_x.size())
         D_z = (displacement[:, :-1, :-1, 1:, :] - displacement[:, :-1, :-1, :-1, :])
-        print(D_z.size())
 
         D1 = (D_x[..., 0] + 1) * ((D_y[..., 1] + 1) * (D_z[..., 2] + 1) - D_y[..., 2] * D_z[..., 1])
         D2 = (D_x[..., 1]) * (D_y[..., 0] * (D_z[..., 2] + 1) - D_y[..., 2] * D_z[..., 0])

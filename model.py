@@ -198,6 +198,42 @@ class ConvLSTM(nn.Module):
         return param
 
 
+class convFormer(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(convFormer, self).__init__()
+        self.conv_q = ConvBlock(in_channels, out_channels, kernel_size=(1, 1, 1), padding=(0, 0, 0), bias=True)
+        self.conv_k = ConvBlock(in_channels, out_channels, kernel_size=(1, 1, 1), padding=(0, 0, 0), bias=True)
+        self.conv_v = ConvBlock(in_channels, out_channels, kernel_size=(1, 1, 1), padding=(0, 0, 0), bias=True)
+        self.attention = Attn(out_channels, out_channels)
+        self.conv_forward = nn.Conv3d(out_channels, out_channels, kernel_size=(1, 1, 1))
+
+        self.active_relu = nn.ReLU()
+        self.active_sigmoid = nn.Sigmoid()
+
+    def forward(self, c, e):
+        queries = []
+        keys = []
+        values = []
+        time_length = e.size()[0]
+        for time_index in range(time_length):
+            print(e[time_index].size())
+            q = self.conv_q(e[time_index])
+            k = self.conv_k(c[time_index])
+            v = self.conv_v(c[time_index])
+            queries.append(q)
+            keys.append(k)
+            values.append(v)
+        outs = []
+        for queries_index in range(time_length):
+            out = values[queries_index]
+            for keys_index in range(time_length):
+                out = self.attention(queries[queries_index], keys[keys_index]) \
+                      * values[keys_index]
+                out = self.conv_forward(out)
+            outs.append(out)
+        return torch.stack(outs, dim=0)
+
+
 class Attn(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(Attn, self).__init__()
@@ -211,7 +247,9 @@ class Attn(nn.Module):
     def forward(self, c, p):
         out = self.conv3(self.active_relu(self.conv1(c) + self.conv2(p)))
         scale = self.active_sigmoid(out)
-        out = scale * p + c
+        # out = scale * p + c
+        out = torch.cat((scale * p, c), dim=1)
+
         return out
 
 
@@ -294,13 +332,13 @@ class Ulstm_Attn2(nn.Module):
         self.down_2 = ConvLSTM(input_dim=32, hidden_dim=64, kernel_size=(3, 3, 3))
         self.down_3 = ConvLSTM(input_dim=64, hidden_dim=128, kernel_size=(3, 3, 3))
         self.up_3 = ConvLSTM(input_dim=128, hidden_dim=64, kernel_size=(3, 3, 3))
-        self.up_20 = ConvLSTM(input_dim=64, hidden_dim=64, kernel_size=(3, 3, 3))
+        self.up_20 = ConvLSTM(input_dim=128, hidden_dim=64, kernel_size=(3, 3, 3))
         self.up_21 = ConvLSTM(input_dim=64, hidden_dim=32, kernel_size=(3, 3, 3))
-        self.up_10 = ConvLSTM(input_dim=32, hidden_dim=32, kernel_size=(3, 3, 3))
+        self.up_10 = ConvLSTM(input_dim=64, hidden_dim=32, kernel_size=(3, 3, 3))
         self.up_11 = ConvLSTM(input_dim=32, hidden_dim=16, kernel_size=(3, 3, 3))
-        self.up_conv = nn.Conv3d(in_channels=16, out_channels=3, kernel_size=(3, 3, 3), padding=1)
-        self.attn_1 = Attn(in_channels=64, out_channels=64)
-        self.attn_2 = Attn(in_channels=32, out_channels=32)
+        self.up_conv = nn.Conv3d(in_channels=16, out_channels=3, kernel_size=(3, 3, 3), padding=(1, 1, 1))
+        self.attn_1 = convFormer(in_channels=64, out_channels=128)
+        self.attn_2 = convFormer(in_channels=32, out_channels=64)
 
     def forward(self, x):
         embedding_list = []
@@ -327,10 +365,13 @@ class Ulstm_Attn2(nn.Module):
         x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
                           recompute_scale_factor=False)
 
+        print(x.size())
         x = self.up_3(x.unsqueeze(0))
+        print(x.size())
+
         x = F.interpolate(x.squeeze(0), size=down_list[1].size()[2:], mode='trilinear', align_corners=True,
                           recompute_scale_factor=False)
-        # print('attn1_input:', x.size(), down_list[1].size())
+        print('attn1_input:', x.size(), down_list[1].size())
 
         x = self.attn_1(x, down_list[1])
         # x = self.attn(x, down_list[1])
@@ -519,6 +560,7 @@ class RegNet(nn.Module):
     1. forward：生成从template向图像序列配准的形变场
     2. pairwise_forward：生成从增维的T00向图像序列配准的形变场
     """
+
     def __init__(self, dim=3, seq_len=6, config=None, scale=0.5):
         super().__init__()
         assert dim in (2, 3)
@@ -527,8 +569,8 @@ class RegNet(nn.Module):
         self.scale = scale
         self.config = config
         # self.unet = Ulstm()
-        self.unet = UlstmCatSkipConnect()
-        # self.unet = Ulstm_Attn2()
+        # self.unet = UlstmCatSkipConnect()
+        self.unet = Ulstm_Attn2()
         self.spatial_transform = SpatialTransformer(self.dim)
         self.ncc_loss = loss.NCC(self.config.dim, self.config.ncc_window_size)
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config.learning_rate, eps=1e-3)

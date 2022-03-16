@@ -10,6 +10,7 @@ import tqdm
 from apex import amp
 
 import util
+from loss import Get_Ja
 from util import CalTRE, write_loss, load_data, get_case, init_model
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -65,10 +66,10 @@ def main(args):
     if args.apex:
         regnet, regnet.optimizer = amp.initialize(regnet, regnet.optimizer, opt_level="O1")
 
-    Forward = regnet.pairwise_forward if not args.group else regnet.forward
-    Update = regnet.pairwise_update if not args.group else regnet.update
-    Sample = regnet.pairwise_sample if not args.group else regnet.sample
-    Sample_Slice = regnet.pairwise_sample_slice if not args.group else regnet.sample_slice
+    Forward = regnet.pairwise_forward
+    Update = regnet.pairwise_update
+    Sample = regnet.pairwise_sample
+    Sample_Slice = regnet.pairwise_sample_slice
 
     iter = regnet.load() if config.load else 0
 
@@ -86,22 +87,14 @@ def main(args):
             if i % config.pair_disp_calc_interval == 0:
                 res = Forward(input_image)
                 # 每隔指定轮数，测试TRE
-                if args.group:
-                    mean, std, diff = regnet.calcdisp.cal_tre(res, config, grid_tuple, landmark_00_converted,
-                                                              landmark_disp,
-                                                              pixel_spacing)
-                else:
-                    flow = res['disp_t2i'][config.fixed_disp_indexes]
-                    calTRE = CalTRE(grid_tuple, flow)
-                    mean, std, diff = calTRE.cal_disp(landmark_00_converted, landmark_50_converted, pixel_spacing)
+                flow = res['disp_t2i'][config.fixed_disp_indexes]
+                calTRE = CalTRE(grid_tuple, flow)
+                mean, std, diff = calTRE.cal_disp(landmark_00_converted, landmark_50_converted, pixel_spacing)
 
                 diff_stats.append([i, mean, std])
                 print(f'\ndiff: {mean:.2f}+-{std:.2f}({np.max(diff):.2f})')
 
-            if args.group:
-                simi_loss, smooth_loss, cyclic_loss, total_loss = Update(input_image)
-            else:
-                simi_loss, smooth_loss, total_loss = Update(input_image)
+            simi_loss, smooth_loss, total_loss = Update(input_image)
 
             stop_criterion.add(simi_loss)
             if stop_criterion.stop():
@@ -113,13 +106,9 @@ def main(args):
         Sample_Slice(input_image, os.path.join(states_folder, states_file), 'best')
 
         # 训练结束，测试TRE
-        if args.group:
-            mean, std, diff = regnet.calcdisp.cal_tre(res, config, grid_tuple, landmark_00_converted, landmark_disp,
-                                                      pixel_spacing)
-        else:
-            flow = res['disp_t2i'][config.fixed_disp_indexes]
-            calTRE = CalTRE(grid_tuple, flow)
-            mean, std, diff = calTRE.cal_disp(landmark_00_converted, landmark_50_converted, pixel_spacing)
+        flow = res['disp_t2i'][config.fixed_disp_indexes]
+        calTRE = CalTRE(grid_tuple, flow)
+        mean, std, diff = calTRE.cal_disp(landmark_00_converted, landmark_50_converted, pixel_spacing)
 
         diff_stats.append([i, np.mean(diff), np.std(diff)])
         print(f'\ndiff: {mean:.2f}+-{std:.2f}({np.max(diff):.2f})')
@@ -136,17 +125,19 @@ def main(args):
         with torch.no_grad():
             res = Forward(input_image)
             # Sample(input_image, config.load[:-4], 'test')
-            if args.group:
-                mean, std, diff = regnet.calcdisp.cal_tre(res, config, grid_tuple, landmark_00_converted, landmark_disp,
-                                                          pixel_spacing)
-            else:
-                print('disp size:', res['disp_t2i'][config.fixed_disp_indexes].size())
-                calTRE = CalTRE(grid_tuple, res['disp_t2i'][config.fixed_disp_indexes])
-                mean, std, diff = calTRE.cal_disp(landmark_00_converted, landmark_50_converted, pixel_spacing)
 
-            if True:
-                flow = res['disp_t2i'].detach().cpu()  # .numpy()
-                torch.save(res['disp_t2i'], 'result/disp_' + states_file + '.pth')
+            print('disp size:', res['disp_t2i'][config.fixed_disp_indexes].size())
+            calTRE = CalTRE(grid_tuple, res['disp_t2i'][config.fixed_disp_indexes])
+            mean, std, diff = calTRE.cal_disp(landmark_00_converted, landmark_50_converted, pixel_spacing)
+
+            flow = res['disp_t2i'].detach().cpu()  # .numpy()
+
+            lossFuc = Get_Ja()
+            jac = lossFuc.loss_3D(flow).numpy()
+            exist = (jac < 0) * 1.0
+            print(f'jacobin < 0: {np.sum(exist) / (6 * 89 * 163 * 230) * 100} %')
+
+            torch.save(flow, 'result/disp_' + states_file + '.pth')
             print(f'\ndiff: {mean:.2f}+-{std:.2f}({np.max(diff):.2f})')
 
 
@@ -161,7 +152,6 @@ if __name__ == '__main__':
     parser.add_argument('--load', type=str, default=None, help='help')
     parser.add_argument('--test', action='store_true', default=False, help='train or test model')
     parser.add_argument('--apex', action='store_true', default=False, help='train or test model')
-    parser.add_argument('--group', action='store_true', default=False, help='train methods, groupwise or pairwise')
     parser.add_argument('--model', type=str, default='lstm_se', help='model name')
     parser.add_argument('-name', '--write_name', type=str, default=None, help='name of saved model')
     args = parser.parse_args()
