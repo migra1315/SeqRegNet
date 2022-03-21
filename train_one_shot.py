@@ -50,7 +50,7 @@ def main(args):
     landmark_info = torch.load(landmark_file)
     landmark_00 = landmark_info['landmark_00']
     landmark_50 = landmark_info['landmark_50']
-    landmark_disp = landmark_info['disp_00_50'] if args.group else None
+    # landmark_disp = landmark_info['disp_00_50'] if args.group else None
 
     grid_tuple = [np.arange(grid_length, dtype=np.float32) for grid_length in image_shape]
     landmark_00_converted = np.flip(landmark_00, axis=1) - np.array(

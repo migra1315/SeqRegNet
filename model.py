@@ -214,12 +214,11 @@ class convFormer(nn.Module):
         queries = []
         keys = []
         values = []
-        time_length = e.size()[0]
+        time_length = e.size()[1]
         for time_index in range(time_length):
-            print(e[time_index].size())
-            q = self.conv_q(e[time_index])
-            k = self.conv_k(c[time_index])
-            v = self.conv_v(c[time_index])
+            q = self.conv_q(e[:, time_index, :])
+            k = self.conv_k(c[:, time_index, :])
+            v = self.conv_v(c[:, time_index, :])
             queries.append(q)
             keys.append(k)
             values.append(v)
@@ -229,9 +228,9 @@ class convFormer(nn.Module):
             for keys_index in range(time_length):
                 out = self.attention(queries[queries_index], keys[keys_index]) \
                       * values[keys_index]
-                out = self.conv_forward(out)
+                out = self.conv_forward(out + queries[queries_index])
             outs.append(out)
-        return torch.stack(outs, dim=0)
+        return torch.stack(outs, dim=1)
 
 
 class Attn(nn.Module):
@@ -248,9 +247,9 @@ class Attn(nn.Module):
         out = self.conv3(self.active_relu(self.conv1(c) + self.conv2(p)))
         scale = self.active_sigmoid(out)
         # out = scale * p + c
-        out = torch.cat((scale * p, c), dim=1)
+        # out = torch.cat((scale * p, c), dim=1)
 
-        return out
+        return scale
 
 
 class Ulstm(nn.Module):
@@ -355,35 +354,27 @@ class Ulstm_Attn2(nn.Module):
         x = self.down_1(embedding)
         del embedding
         x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False)
+                          recompute_scale_factor=False).unsqueeze(0)
         down_list.append(x)
-        x = self.down_2(x.unsqueeze(0))
+        x = self.down_2(x)
         x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False)
+                          recompute_scale_factor=False).unsqueeze(0)
         down_list.append(x)
-        x = self.down_3(x.unsqueeze(0))
+        x = self.down_3(x)
         x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False)
+                          recompute_scale_factor=False).unsqueeze(0)
 
-        print(x.size())
-        x = self.up_3(x.unsqueeze(0))
-        print(x.size())
-
-        x = F.interpolate(x.squeeze(0), size=down_list[1].size()[2:], mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False)
-        print('attn1_input:', x.size(), down_list[1].size())
+        x = self.up_3(x)
+        x = F.interpolate(x.squeeze(0), size=down_list[1].size()[3:], mode='trilinear', align_corners=True,
+                          recompute_scale_factor=False).unsqueeze(0)
 
         x = self.attn_1(x, down_list[1])
-        # x = self.attn(x, down_list[1])
-        x = self.up_20(x.unsqueeze(0))
-        x = self.up_21(x)
-        x = F.interpolate(x.squeeze(0), size=down_list[0].size()[2:], mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False)
+        x = self.up_21(self.up_20(x))
+        x = F.interpolate(x.squeeze(0), size=down_list[0].size()[3:], mode='trilinear', align_corners=True,
+                          recompute_scale_factor=False).unsqueeze(0)
 
         x = self.attn_2(x, down_list[0])
-        # x = self.attn(x, down_list[0])
-        x = self.up_10(x.unsqueeze(0))
-        x = self.up_11(x)
+        x = self.up_11(self.up_10(x))
         x = F.interpolate(x.squeeze(0), scale_factor=2, mode='trilinear', align_corners=True,
                           recompute_scale_factor=False)
 
@@ -423,20 +414,17 @@ class UlstmCatSkipConnect(nn.Module):
     def forward(self, x):
         embedding_list = []
         # 需求input [6, 1, 48, 128, 128]
-        # print('input:', x.size())
         seq_len = x.size()[0]
         image_shape = x.size()[2:]
         for index in range(seq_len):
             embedding = self.down_conv(x[index:index + 1, :])
             embedding_list.append(embedding)
         embedding = torch.stack(embedding_list, dim=1)
-        # print('embedding:', embedding.size())
 
         del embedding_list
 
         down_list = []
         x = self.down_1(embedding)
-        # print('down_1:', x.size())
         del embedding
         x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
                           recompute_scale_factor=False)
@@ -459,44 +447,37 @@ class UlstmCatSkipConnect(nn.Module):
         x = self.up_30(x.unsqueeze(0))
         x = self.up_31(x)
 
-        # print('up_3:', x.size())
 
         x = F.interpolate(x.squeeze(0), size=down_list[1].size()[2:], mode='trilinear', align_corners=True,
                           recompute_scale_factor=False)
         # print('up_3_:', x.size())
 
         x = torch.cat((x, down_list[1]), dim=1)
-        # print('up_2_input:', x.size())
 
         x = self.up_20(x.unsqueeze(0))
         # print('up_20:', x.size())
 
         x = self.up_21(x)
-        # print('up_21:', x.size())
 
         x = F.interpolate(x.squeeze(0), size=down_list[0].size()[2:], mode='trilinear', align_corners=True,
                           recompute_scale_factor=False)
         # print('up_2_:', x.size())
 
         x = torch.cat((x, down_list[0]), dim=1)
-        # print('up_1_input:', x.size())
 
         x = self.up_10(x.unsqueeze(0))
         # print('up_10:', x.size())
 
         x = self.up_11(x)
-        # print('up_11:', x.size())
 
         x = F.interpolate(x.squeeze(0), scale_factor=2, mode='trilinear', align_corners=True,
                           recompute_scale_factor=False)
-        # print('up_1_:', x.size())
 
         disp_list = []
         for index in range(seq_len):
             disp = self.up_conv(x[index:index + 1, :])
             disp_list.append(disp)
         disp = torch.stack(disp_list, dim=1).squeeze(0)
-        # print('output:', disp.size())
 
         del x
         del disp_list
@@ -569,8 +550,8 @@ class RegNet(nn.Module):
         self.scale = scale
         self.config = config
         # self.unet = Ulstm()
-        # self.unet = UlstmCatSkipConnect()
-        self.unet = Ulstm_Attn2()
+        self.unet = UlstmCatSkipConnect()
+        # self.unet = Ulstm_Attn2()
         self.spatial_transform = SpatialTransformer(self.dim)
         self.ncc_loss = loss.NCC(self.config.dim, self.config.ncc_window_size)
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config.learning_rate, eps=1e-3)
