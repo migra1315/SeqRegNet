@@ -190,6 +190,58 @@ class CalTRE():
 def get_case(case_num):
     if case_num == 0:
         case = 0
+        crop_range = [slice(0, 96), slice(0, 256), slice(0, 256)]
+        pixel_spacing = np.array([0.97, 0.97, 5], dtype=np.float32)
+
+    elif case_num == 1:
+        case = 1
+        # crop_range = [slice(0, 96), slice(0, 256), slice(0, 256)]
+        # pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
+
+        crop_range = [slice(0, 83), slice(43, 200), slice(10, 250)]
+        pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
+    elif case_num == 2:
+        case = 2
+        crop_range = [slice(1, 97), slice(0, 256), slice(0, 256)]
+        pixel_spacing = np.array([1.16, 1.16, 2.5], dtype=np.float32)
+    elif case_num == 3:
+        case = 3
+        crop_range = [slice(2, 98), slice(0, 256), slice(0, 256)]
+        pixel_spacing = np.array([1.15, 1.15, 2.5], dtype=np.float32)
+    elif case_num == 4:
+        case = 4
+        crop_range = [slice(0, 96), slice(0, 256), slice(0, 256)]
+        pixel_spacing = np.array([1.13, 1.13, 2.5], dtype=np.float32)
+    elif case_num == 5:
+        case = 5
+        crop_range = [slice(0, 96), slice(0, 256), slice(0, 256)]
+        pixel_spacing = np.array([1.10, 1.10, 2.5], dtype=np.float32)
+    elif case_num == 6:
+        case = 6
+        crop_range = [slice(13, 109), slice(118, 374), slice(152, 408)]
+        pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
+    elif case_num == 7:
+        case = 7
+        crop_range = [slice(14, 110), slice(108, 364), slice(142, 398)]
+        pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
+    elif case_num == 8:
+        case = 8
+        crop_range = [slice(18, 114), slice(68, 324), slice(125, 381)]
+        pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
+    elif case_num == 9:
+        case = 9
+        crop_range = [slice(0, 96), slice(105, 361), slice(133, 389)]
+        pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
+    else:
+        case = 10
+        crop_range = [slice(0, 96), slice(98, 354), slice(131, 387)]
+        pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
+    return case, crop_range, pixel_spacing
+
+
+def get_case_demo(case_num):
+    if case_num == 0:
+        case = 0
         crop_range = [slice(0, 66), slice(170, 430), slice(50, 450)]
         pixel_spacing = np.array([0.97, 0.97, 5], dtype=np.float32)
     elif case_num == 1:
@@ -255,8 +307,10 @@ def load_data(data_folder, crop_range):
     input_image = (input_image - input_image.min()) / (input_image.max() - input_image.min())
 
     input_image = input_image[:, :, crop_range[0], crop_range[1], crop_range[2]]
-    image_shape = input_image.size()[2:]  # (d, h, w)
     num_image = input_image.shape[0]  # number of image in the group
+    # if input_image.size()[2] < 96:
+    #     input_image = torch.cat((input_image, torch.zeros([num_image, 1, 2, 256, 256])), dim=2)
+    image_shape = input_image.size()[2:]
     return input_image, image_shape, num_image
 
 
@@ -350,7 +404,5 @@ class SingleDataSet(data.Dataset):
 
         return InputImg
 
-
     def __len__(self):
         return len(self.ImgPathList)
-

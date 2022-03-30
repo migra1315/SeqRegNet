@@ -198,14 +198,16 @@ class ConvLSTM(nn.Module):
         return param
 
 
-class convFormer(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(convFormer, self).__init__()
-        self.conv_q = ConvBlock(in_channels, out_channels, kernel_size=(1, 1, 1), padding=(0, 0, 0), bias=True)
-        self.conv_k = ConvBlock(in_channels, out_channels, kernel_size=(1, 1, 1), padding=(0, 0, 0), bias=True)
-        self.conv_v = ConvBlock(in_channels, out_channels, kernel_size=(1, 1, 1), padding=(0, 0, 0), bias=True)
+class ConvFormer(nn.Module):
+    def __init__(self, in_channels, out_channels, position_embedding_size, kernel_size=(3, 3, 3), padding=(1, 1, 1)):
+        super(ConvFormer, self).__init__()
+        self.conv_q = ConvBlock(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=True)
+        self.conv_k = ConvBlock(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=True)
+        self.conv_v = ConvBlock(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=True)
         self.attention = Attn(out_channels, out_channels)
-        self.conv_forward = nn.Conv3d(out_channels, out_channels, kernel_size=(1, 1, 1))
+        self.conv_forward = ConvBlock(out_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=True)
+        # nn.Conv3d(out_channels, out_channels, kernel_size=(1, 1, 1))
+        # self.position_embedding = nn.Parameter(torch.zeros(position_embedding_size))
 
         self.active_relu = nn.ReLU()
         self.active_sigmoid = nn.Sigmoid()
@@ -215,6 +217,8 @@ class convFormer(nn.Module):
         keys = []
         values = []
         time_length = e.size()[1]
+        # c = c + self.position_embedding
+        # e = e + self.position_embedding
         for time_index in range(time_length):
             q = self.conv_q(e[:, time_index, :])
             k = self.conv_k(c[:, time_index, :])
@@ -224,11 +228,11 @@ class convFormer(nn.Module):
             values.append(v)
         outs = []
         for queries_index in range(time_length):
-            out = values[queries_index]
+            out = torch.zeros_like(values[queries_index])
             for keys_index in range(time_length):
-                out = self.attention(queries[queries_index], keys[keys_index]) \
-                      * values[keys_index]
-                out = self.conv_forward(out + queries[queries_index])
+                out += self.attention(queries[queries_index], keys[keys_index]) \
+                       * values[keys_index]
+            out = self.conv_forward(out + queries[queries_index])
             outs.append(out)
         return torch.stack(outs, dim=1)
 
@@ -250,6 +254,71 @@ class Attn(nn.Module):
         # out = torch.cat((scale * p, c), dim=1)
 
         return scale
+
+
+class DownConvLSTMBlock(nn.Module):
+    def __init__(self, input_channels, hidden_channels, kernel_size):
+        super().__init__()
+        self.block = ConvLSTM(input_channels, hidden_channels, kernel_size)
+
+    def forward(self, x):
+        x = self.block(x)
+        x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
+                          recompute_scale_factor=True)
+        return x.unsqueeze(0)
+
+
+class UpConvLSTMBlock(nn.Module):
+    def __init__(self, input_channels, hidden_channels, kernel_size):
+        super().__init__()
+        self.block1 = ConvLSTM(input_channels, hidden_channels, kernel_size)
+        # self.atten =ConvFormer(in_channels=hidden_channels, out_channels=hidden_channels, position_embedding_size=None)
+        self.block2 = ConvLSTM(input_channels, hidden_channels, kernel_size)
+
+    def forward(self, x, skip):
+        x = self.block1(x)
+        skip = F.interpolate(skip.squeeze(0), size=x.size()[3:], mode='trilinear', align_corners=True).unsqueeze(0)
+        x = torch.cat([x, skip], dim=2)
+        x = self.block2(x)
+        # x = self.atten(x,skip)
+        x = F.interpolate(x.squeeze(0), scale_factor=2, mode='trilinear', align_corners=True,
+                          recompute_scale_factor=True)
+        return x.unsqueeze(0)
+
+
+class Ulstm_cat(nn.Module):
+    def __init__(self, input_channels, output_channels, initial_channels, depth=4, kernel_size=(3, 3, 3)):
+        super(Ulstm_cat, self).__init__()
+        self.depth = depth
+        prev_channels = input_channels
+        self.down_path = nn.ModuleList()
+        for i in range(self.depth):
+            current_channels = 2 ** i * initial_channels
+            self.down_path.append(DownConvLSTMBlock(input_channels=prev_channels, hidden_channels=current_channels,
+                                                    kernel_size=kernel_size))
+            prev_channels = current_channels
+
+        self.up_path = nn.ModuleList()
+        for i in reversed(range(self.depth - 1)):
+            current_channels = 2 ** i * initial_channels
+            self.up_path.append(UpConvLSTMBlock(input_channels=prev_channels, hidden_channels=current_channels,
+                                                kernel_size=kernel_size))
+            prev_channels = current_channels
+        self.last = ConvLSTM(prev_channels, 3, kernel_size)
+
+    def forward(self, x):
+        blocks = []
+        in_size = x.size()[3:]
+        for i, down in enumerate(self.down_path):
+            x = down(x)
+            if i < self.depth - 1:
+                blocks.append(x)
+        for i, up in enumerate(self.up_path):
+            x = up(x, blocks[-i - 1])
+            # print(x.size(),blocks[-i-1].size())
+        x = self.last(x)
+        x = F.interpolate(x.squeeze(0), size=in_size, mode='trilinear', align_corners=True).unsqueeze(0)
+        return x
 
 
 class Ulstm(nn.Module):
@@ -322,9 +391,9 @@ class Ulstm(nn.Module):
         return disp
 
 
-class Ulstm_Attn2(nn.Module):
+class Ulstm_Conv_Former(nn.Module):
     def __init__(self):
-        super(Ulstm_Attn2, self).__init__()
+        super(Ulstm_Conv_Former, self).__init__()
         self.down_conv = ConvBlock(in_channels=1, out_channels=16,
                                    kernel_size=(3, 3, 3), padding=1, bias=True)
         self.down_1 = ConvLSTM(input_dim=16, hidden_dim=32, kernel_size=(3, 3, 3))
@@ -336,8 +405,8 @@ class Ulstm_Attn2(nn.Module):
         self.up_10 = ConvLSTM(input_dim=64, hidden_dim=32, kernel_size=(3, 3, 3))
         self.up_11 = ConvLSTM(input_dim=32, hidden_dim=16, kernel_size=(3, 3, 3))
         self.up_conv = nn.Conv3d(in_channels=16, out_channels=3, kernel_size=(3, 3, 3), padding=(1, 1, 1))
-        self.attn_1 = convFormer(in_channels=64, out_channels=128)
-        self.attn_2 = convFormer(in_channels=32, out_channels=64)
+        self.attn_1 = ConvFormer(in_channels=64, out_channels=128, position_embedding_size=[1, 6, 64, 9, 25, 25])
+        self.attn_2 = ConvFormer(in_channels=32, out_channels=64, position_embedding_size=[1, 6, 32, 19, 51, 51])
 
     def forward(self, x):
         embedding_list = []
@@ -347,12 +416,11 @@ class Ulstm_Attn2(nn.Module):
         for index in range(seq_len):
             embedding = self.down_conv(x[index:index + 1, :])
             embedding_list.append(embedding)
-        embedding = torch.stack(embedding_list, dim=1)
+        x = torch.stack(embedding_list, dim=1)
         del embedding_list
 
         down_list = []
-        x = self.down_1(embedding)
-        del embedding
+        x = self.down_1(x)
         x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
                           recompute_scale_factor=False).unsqueeze(0)
         down_list.append(x)
@@ -368,11 +436,13 @@ class Ulstm_Attn2(nn.Module):
         x = F.interpolate(x.squeeze(0), size=down_list[1].size()[3:], mode='trilinear', align_corners=True,
                           recompute_scale_factor=False).unsqueeze(0)
 
+        # print("attn1 size:", x.size())
         x = self.attn_1(x, down_list[1])
         x = self.up_21(self.up_20(x))
         x = F.interpolate(x.squeeze(0), size=down_list[0].size()[3:], mode='trilinear', align_corners=True,
                           recompute_scale_factor=False).unsqueeze(0)
 
+        # print("attn2 size:", x.size())
         x = self.attn_2(x, down_list[0])
         x = self.up_11(self.up_10(x))
         x = F.interpolate(x.squeeze(0), scale_factor=2, mode='trilinear', align_corners=True,
@@ -382,11 +452,9 @@ class Ulstm_Attn2(nn.Module):
         for index in range(seq_len):
             disp = self.up_conv(x[index:index + 1, :])
             disp_list.append(disp)
-        disp = torch.stack(disp_list, dim=1).squeeze(0)
-        del x
-        del disp_list
-        disp = F.interpolate(disp, size=image_shape, mode='trilinear', align_corners=True, recompute_scale_factor=False)
-        return disp
+        x = torch.stack(disp_list, dim=1).squeeze(0)
+        x = F.interpolate(x, size=image_shape, mode='trilinear', align_corners=True, recompute_scale_factor=False)
+        return x
 
 
 class UlstmCatSkipConnect(nn.Module):
@@ -419,49 +487,38 @@ class UlstmCatSkipConnect(nn.Module):
         for index in range(seq_len):
             embedding = self.down_conv(x[index:index + 1, :])
             embedding_list.append(embedding)
-        embedding = torch.stack(embedding_list, dim=1)
+        x = torch.stack(embedding_list, dim=1)
 
         del embedding_list
 
         down_list = []
-        x = self.down_1(embedding)
-        del embedding
+        x = self.down_1(x)
         x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
                           recompute_scale_factor=False)
-        # print('down_1_:', x.size())
 
         down_list.append(x)
         x = self.down_2(x.unsqueeze(0))
-        # print('down_2:', x.size())
         x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
                           recompute_scale_factor=False)
-        # print('down_2_:', x.size())
-
         down_list.append(x)
         x = self.down_3(x.unsqueeze(0))
-        # print('down_3:', x.size())
         x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
                           recompute_scale_factor=False)
-        # print('down_3_:', x.size())
 
         x = self.up_30(x.unsqueeze(0))
         x = self.up_31(x)
 
-
         x = F.interpolate(x.squeeze(0), size=down_list[1].size()[2:], mode='trilinear', align_corners=True,
                           recompute_scale_factor=False)
-        # print('up_3_:', x.size())
 
         x = torch.cat((x, down_list[1]), dim=1)
 
         x = self.up_20(x.unsqueeze(0))
-        # print('up_20:', x.size())
 
         x = self.up_21(x)
 
         x = F.interpolate(x.squeeze(0), size=down_list[0].size()[2:], mode='trilinear', align_corners=True,
                           recompute_scale_factor=False)
-        # print('up_2_:', x.size())
 
         x = torch.cat((x, down_list[0]), dim=1)
 
@@ -477,13 +534,11 @@ class UlstmCatSkipConnect(nn.Module):
         for index in range(seq_len):
             disp = self.up_conv(x[index:index + 1, :])
             disp_list.append(disp)
-        disp = torch.stack(disp_list, dim=1).squeeze(0)
+        x = torch.stack(disp_list, dim=1).squeeze(0)
 
-        del x
-        del disp_list
-        disp = F.interpolate(disp, size=image_shape, mode='trilinear', align_corners=True,
-                             recompute_scale_factor=False)
-        return disp
+        x = F.interpolate(x, size=image_shape, mode='trilinear', align_corners=True,
+                          recompute_scale_factor=False)
+        return x
 
 
 class SpatialTransformer(nn.Module):
@@ -550,111 +605,114 @@ class RegNet(nn.Module):
         self.scale = scale
         self.config = config
         # self.unet = Ulstm()
-        self.unet = UlstmCatSkipConnect()
-        # self.unet = Ulstm_Attn2()
+        # self.unet = UlstmCatSkipConnect()
+        self.unet = Ulstm_Conv_Former()
+
         self.spatial_transform = SpatialTransformer(self.dim)
         self.ncc_loss = loss.NCC(self.config.dim, self.config.ncc_window_size)
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config.learning_rate, eps=1e-3)
         self.calcdisp = util.CalcDisp(dim=self.config.dim, calc_device=config.device)
         self.description()
-
-    def forward(self, input_image):
-        original_image_shape = input_image.shape[2:]  # d, h, w
-        # input : [6, 1, 96, 256, 256]
-        # 下采样至1/2
-        if self.scale < 1:
-            scaled_image = F.interpolate(input_image, scale_factor=self.scale, align_corners=True,
-                                         mode='bilinear' if self.dim == 2 else 'trilinear',
-                                         recompute_scale_factor=False)  # (1, n, h, w) or (1, n, d, h, w)
-        else:
-            scaled_image = input_image
-        # scaled_image : [6, 1, 48, 128, 128]
-
-        scaled_image_shape = scaled_image.shape[2:]
-        scaled_disp_t2i = self.unet(scaled_image)
-        # scaled_disp_t2i: [6, 3, 48, 128, 128]
-
-        if self.scale < 1:
-            disp_t2i = F.interpolate(scaled_disp_t2i, size=original_image_shape,
-                                     mode='bilinear' if self.dim == 2 else 'trilinear', align_corners=True)
-        else:
-            disp_t2i = scaled_disp_t2i
-        # disp_t2i: [6, 3, 96, 256, 256]
-
-        warped_input_image = self.spatial_transform(input_image, disp_t2i)
-        # [6, 1, 96, 256, 256] @ [6, 3, 96, 256, 256] = [6, 1, 96, 256, 256]
-        template = torch.mean(warped_input_image, 0, keepdim=True)  # [1, 1, 96, 256, 256]
-
-        if self.scale < 1:
-            scaled_template = F.interpolate(template, size=scaled_image_shape,
-                                            mode='bilinear' if self.dim == 2 else 'trilinear', align_corners=True)
-        else:
-            scaled_template = template
-        res = {'disp_t2i': disp_t2i, 'scaled_disp_t2i': scaled_disp_t2i, 'warped_input_image': warped_input_image,
-               'template': template, 'scaled_template': scaled_template}
-        return res
-
-    def update(self, input_image):
-        self.optimizer.zero_grad()
-        res = self.forward(input_image)
-        total_loss = 0.
-        if 'disp_i2t' in res:
-            simi_loss = (self.ncc_loss(res['warped_input_image'], res['template']) + self.ncc_loss(input_image, res[
-                'warped_template'])) / 2.
-        else:
-            simi_loss = self.ncc_loss(res['warped_input_image'], res['template'])
-        total_loss += simi_loss
-
-        if self.config.smooth_reg > 0:
-            if 'disp_i2t' in res:
-                smooth_loss = (loss.smooth_loss(res['scaled_disp_t2i']) + loss.smooth_loss(res['scaled_disp_i2t'])) / 2.
+        '''
+    
+        def forward(self, input_image):
+            original_image_shape = input_image.shape[2:]  # d, h, w
+            # input : [6, 1, 96, 256, 256]
+            # 下采样至1/2
+            if self.scale < 1:
+                scaled_image = F.interpolate(input_image, scale_factor=self.scale, align_corners=True,
+                                             mode='bilinear' if self.dim == 2 else 'trilinear',
+                                             recompute_scale_factor=False)  # (1, n, h, w) or (1, n, d, h, w)
             else:
-                smooth_loss = loss.smooth_loss(res['scaled_disp_t2i'], res['scaled_template'])
-            total_loss += self.config.smooth_reg * smooth_loss
-            smooth_loss_item = smooth_loss.item()
-        else:
-            smooth_loss_item = 0
-
-        if self.config.cyclic_reg > 0:
-            if 'disp_i2t' in res:
-                cyclic_loss = ((torch.mean((torch.sum(res['scaled_disp_t2i'], 0)) ** 2)) ** 0.5 + (
-                    torch.mean((torch.sum(res['scaled_disp_i2t'], 0)) ** 2)) ** 0.5) / 2.
+                scaled_image = input_image
+            # scaled_image : [6, 1, 48, 128, 128]
+    
+            scaled_image_shape = scaled_image.shape[2:]
+            scaled_disp_t2i = self.unet(scaled_image)
+            # scaled_disp_t2i: [6, 3, 48, 128, 128]
+    
+            if self.scale < 1:
+                disp_t2i = F.interpolate(scaled_disp_t2i, size=original_image_shape,
+                                         mode='bilinear' if self.dim == 2 else 'trilinear', align_corners=True)
             else:
-                cyclic_loss = (torch.mean((torch.sum(res['scaled_disp_t2i'], 0)) ** 2)) ** 0.5
-            total_loss += self.config.cyclic_reg * cyclic_loss
-            cyclic_loss_item = cyclic_loss.item()
-        else:
-            cyclic_loss_item = 0
-
-        total_loss.backward()
-        self.optimizer.step()
-
-        return simi_loss.item(), smooth_loss_item, cyclic_loss_item, total_loss.item()
-
-    def sample(self, input_image, path, iter):
-        with torch.no_grad():
+                disp_t2i = scaled_disp_t2i
+            # disp_t2i: [6, 3, 96, 256, 256]
+    
+            warped_input_image = self.spatial_transform(input_image, disp_t2i)
+            # [6, 1, 96, 256, 256] @ [6, 3, 96, 256, 256] = [6, 1, 96, 256, 256]
+            template = torch.mean(warped_input_image, 0, keepdim=True)  # [1, 1, 96, 256, 256]
+    
+            if self.scale < 1:
+                scaled_template = F.interpolate(template, size=scaled_image_shape,
+                                                mode='bilinear' if self.dim == 2 else 'trilinear', align_corners=True)
+            else:
+                scaled_template = template
+            res = {'disp_t2i': disp_t2i, 'scaled_disp_t2i': scaled_disp_t2i, 'warped_input_image': warped_input_image,
+                   'template': template, 'scaled_template': scaled_template}
+            return res
+    
+        def update(self, input_image):
+            self.optimizer.zero_grad()
             res = self.forward(input_image)
-            for index in range(res['warped_input_image'].size()[0]):
-                arr = res['warped_input_image'][index, :, :, :, :].detach().squeeze(0).cpu().numpy()
+            total_loss = 0.
+            if 'disp_i2t' in res:
+                simi_loss = (self.ncc_loss(res['warped_input_image'], res['template']) + self.ncc_loss(input_image, res[
+                    'warped_template'])) / 2.
+            else:
+                simi_loss = self.ncc_loss(res['warped_input_image'], res['template'])
+            total_loss += simi_loss
+    
+            if self.config.smooth_reg > 0:
+                if 'disp_i2t' in res:
+                    smooth_loss = (loss.smooth_loss(res['scaled_disp_t2i']) + loss.smooth_loss(res['scaled_disp_i2t'])) / 2.
+                else:
+                    smooth_loss = loss.smooth_loss(res['scaled_disp_t2i'], res['scaled_template'])
+                total_loss += self.config.smooth_reg * smooth_loss
+                smooth_loss_item = smooth_loss.item()
+            else:
+                smooth_loss_item = 0
+    
+            if self.config.cyclic_reg > 0:
+                if 'disp_i2t' in res:
+                    cyclic_loss = ((torch.mean((torch.sum(res['scaled_disp_t2i'], 0)) ** 2)) ** 0.5 + (
+                        torch.mean((torch.sum(res['scaled_disp_i2t'], 0)) ** 2)) ** 0.5) / 2.
+                else:
+                    cyclic_loss = (torch.mean((torch.sum(res['scaled_disp_t2i'], 0)) ** 2)) ** 0.5
+                total_loss += self.config.cyclic_reg * cyclic_loss
+                cyclic_loss_item = cyclic_loss.item()
+            else:
+                cyclic_loss_item = 0
+    
+            total_loss.backward()
+            self.optimizer.step()
+    
+            return simi_loss.item(), smooth_loss_item, cyclic_loss_item, total_loss.item()
+    
+        def sample(self, input_image, path, iter):
+            with torch.no_grad():
+                res = self.forward(input_image)
+                for index in range(res['warped_input_image'].size()[0]):
+                    arr = res['warped_input_image'][index, :, :, :, :].detach().squeeze(0).cpu().numpy()
+                    vol = sitk.GetImageFromArray(arr)
+                    sitk.WriteImage(vol, os.path.join(path, f'warp_{iter}_{index}.nii'))
+    
+                for index in range(res['disp_t2i'].size()[0]):  # 10,3,83,157,240
+                    arr = res['disp_t2i'][index, :, :, :, :].detach().squeeze(0).permute(1, 2, 3, 0).cpu().numpy()
+                    vol = sitk.GetImageFromArray(arr)
+                    sitk.WriteImage(vol, os.path.join(path, f'disp_{iter}_{index}.nii'))
+    
+                arr = res['template'].detach().squeeze(0).squeeze(0).cpu().numpy()
                 vol = sitk.GetImageFromArray(arr)
-                sitk.WriteImage(vol, os.path.join(path, f'warp_{iter}_{index}.nii'))
-
-            for index in range(res['disp_t2i'].size()[0]):  # 10,3,83,157,240
-                arr = res['disp_t2i'][index, :, :, :, :].detach().squeeze(0).permute(1, 2, 3, 0).cpu().numpy()
-                vol = sitk.GetImageFromArray(arr)
-                sitk.WriteImage(vol, os.path.join(path, f'disp_{iter}_{index}.nii'))
-
-            arr = res['template'].detach().squeeze(0).squeeze(0).cpu().numpy()
-            vol = sitk.GetImageFromArray(arr)
-            sitk.WriteImage(vol, os.path.join(path, f'tmp.nii'))
-
-    def sample_slice(self, input_image, path, iter):
-        with torch.no_grad():
-            res = self.forward(input_image)
-            for index in range(res['warped_input_image'].size()[0]):
-                arr = res['warped_input_image'][index, :, :, :, :].detach().squeeze(0)  # 83,157,240
-                slice = arr[30, :, :]
-                vutils.save_image(slice.data, os.path.join(path, f'warp_{iter}_{index}.png'), padding=0, normalize=True)
+                sitk.WriteImage(vol, os.path.join(path, f'tmp.nii'))
+    
+        def sample_slice(self, input_image, path, iter):
+            with torch.no_grad():
+                res = self.forward(input_image)
+                for index in range(res['warped_input_image'].size()[0]):
+                    arr = res['warped_input_image'][index, :, :, :, :].detach().squeeze(0)  # 83,157,240
+                    slice = arr[30, :, :]
+                    vutils.save_image(slice.data, os.path.join(path, f'warp_{iter}_{index}.png'), padding=0, normalize=True)
+        '''
 
     def pairwise_forward(self, input_image):
 
@@ -691,6 +749,134 @@ class RegNet(nn.Module):
                                                       align_corners=True)
         else:
             scaled_warped_input_image = warped_input_image
+        # scaled_warped_input_image: [6, 1, 48, 128, 128]
+
+        res = {'disp_t2i': disp_t2i, 'scaled_disp_t2i': scaled_disp_t2i, 'warped_input_image': warped_input_image,
+               'scaled_warped_input_image': scaled_warped_input_image, 'moving_image': input_image[0, :, :, :, :]}
+        return res
+
+    def pairwise_update(self, input_image):
+        self.optimizer.zero_grad()
+        res = self.pairwise_forward(input_image)
+        total_loss = 0.
+        simi_loss = self.ncc_loss(res['warped_input_image'], input_image)
+        total_loss += simi_loss
+
+        smooth_loss = loss.smooth_loss(res['scaled_disp_t2i'], res['scaled_warped_input_image'])
+        total_loss += self.config.smooth_reg * smooth_loss
+        smooth_loss_item = smooth_loss.item()
+
+        if self.config.apex:
+            with amp.scale_loss(total_loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()  # 梯度自动缩放
+        else:
+            total_loss.backward()
+        self.optimizer.step()
+
+        return simi_loss.item(), smooth_loss_item, total_loss.item()
+
+    def pairwise_sample(self, input_image, path, iter):
+        with torch.no_grad():
+            self.eval()
+            res = self.pairwise_forward(input_image)
+            self.train()
+            # for index in [0, 5]:
+            arr_warped_image = res['warped_input_image'][-1, :, :, :, :].detach().squeeze(0).cpu().numpy()
+            vol_warped_image = sitk.GetImageFromArray(arr_warped_image)
+            vol_warped_image.SetSpacing([0.976, 0.976, 2.5])
+            sitk.WriteImage(vol_warped_image, os.path.join(path, f'warp_{iter}.nii'))
+
+            arr_disp = res['disp_t2i'][-1, :, :, :, :].detach().squeeze(0).permute(1, 2, 3, 0).cpu().numpy()
+            vol_disp = sitk.GetImageFromArray(arr_disp)
+            vol_disp.SetSpacing([0.976, 0.976, 2.5])
+            sitk.WriteImage(vol_disp, os.path.join(path, f'disp_{iter}.nii'))
+
+            arr_moving_image = res['moving_image'].detach().squeeze(0).cpu().numpy()
+            vol_moving_image = sitk.GetImageFromArray(arr_moving_image)
+            vol_moving_image.SetSpacing([0.976, 0.976, 2.5])
+            sitk.WriteImage(vol_moving_image, os.path.join(path, f'moving_{iter}.nii'))
+
+            arr_fixed_image = input_image[-1, :, :, :, :].detach().squeeze(0).cpu().numpy()
+            vol_fixed_image = sitk.GetImageFromArray(arr_fixed_image)
+            vol_fixed_image.SetSpacing([0.976, 0.976, 2.5])
+            sitk.WriteImage(vol_fixed_image, os.path.join(path, f'fixed_{iter}.nii'))
+
+    def pairwise_sample_slice(self, input_image, path, iter):
+        self.eval()
+        with torch.no_grad():
+            res = self.pairwise_forward(input_image)
+            for index in [0, 5]:
+                arr = res['warped_input_image'][index, :, :, :, :].detach().squeeze(0)  # 83,157,240
+                slice = arr[50, :, :]
+                vutils.save_image(slice.data, os.path.join(path, f'warp_{iter}_{index}.png'), padding=0, normalize=True)
+        self.train()
+
+    def load(self):
+        state_file = self.config.load
+        if os.path.exists(state_file):
+            states = torch.load(state_file, map_location=self.config.device)
+            #     iter = len(states['loss_list'])
+            self.load_state_dict(states['model'])
+            print(f'load model and optimizer state {self.config.load}')
+        else:
+            print(f'{self.config.load} doesn\'t exist')
+            return 0
+
+    def description(self):
+        train = 'train' if self.config.train else 'test'
+        scale = self.config.scale
+        max_num_iteration = self.config.max_num_iteration
+        load = self.config.load if self.config.load else 'None'
+        print('------------------------------------')
+        print(f'target: {train}; model: ulstm; scale: {scale}; max_num_iteration: {max_num_iteration}; load: {load}')
+        print('------------------------------------')
+
+
+class RegNet2(nn.Module):
+    """
+    提供了两种训练模式
+    1. forward：生成从template向图像序列配准的形变场
+    2. pairwise_forward：生成从增维的T00向图像序列配准的形变场
+    """
+
+    def __init__(self, dim=3, seq_len=6, config=None, scale=0.5):
+        super().__init__()
+        assert dim in (2, 3)
+        self.dim = dim
+        self.seq_len = seq_len
+        self.scale = scale
+        self.config = config
+        self.unet = Ulstm_cat(input_channels=1, output_channels=3, initial_channels=16, depth=4, kernel_size=(3, 3, 3))
+        self.spatial_transform = SpatialTransformer(self.dim)
+        self.ncc_loss = loss.NCC(self.config.dim, self.config.ncc_window_size)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config.learning_rate, eps=1e-3)
+        self.calcdisp = util.CalcDisp(dim=self.config.dim, calc_device=config.device)
+        self.description()
+
+    def pairwise_forward(self, input_image):
+
+        original_image_shape = input_image.shape[2:]
+        # input_image: [6, 1, 96, 256, 256]
+        # 下采样至1/2
+        scaled_image = F.interpolate(input_image, scale_factor=self.scale, align_corners=True, mode='trilinear',
+                                     recompute_scale_factor=True)  # (1, n, h, w) or (1, n, d, h, w)
+
+        # scaled_image: [6, 1, 48, 128, 128]
+
+        scaled_image_shape = scaled_image.shape[2:]
+        scaled_disp_t2i = self.unet(scaled_image.unsqueeze(0)).squeeze(0)
+
+        # scaled_disp_t2i: [6, 3, 48, 128, 128]
+
+        disp_t2i = F.interpolate(scaled_disp_t2i, size=original_image_shape, mode='trilinear', align_corners=True)
+
+        moving_image = input_image[0:1, :, :, :, :].repeat(self.seq_len, 1, 1, 1, 1)
+
+        warped_input_image = self.spatial_transform(moving_image, disp_t2i)
+        # [6, 1, 96, 256, 256] @ [6, 3, 96, 256, 256] = [6, 1, 96, 256, 256]
+
+        scaled_warped_input_image = F.interpolate(warped_input_image, size=scaled_image_shape, mode='trilinear',
+                                                  align_corners=True)
         # scaled_warped_input_image: [6, 1, 48, 128, 128]
 
         res = {'disp_t2i': disp_t2i, 'scaled_disp_t2i': scaled_disp_t2i, 'warped_input_image': warped_input_image,

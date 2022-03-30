@@ -24,12 +24,14 @@ def main(args):
     data_folder = f'/data/JY/Dirlab/case{case}/'
     landmark_file = f'/data/JY/Dirlab/case{case}/Case{case}_300_00_50.pt'
     states_folder = 'result'
+    if not os.path.exists(states_folder):
+        os.mkdir(states_folder)
     config = dict(
         train=not args.test, load=args.load, scale=args.scale, max_num_iteration=args.max_num_iteration,
         dim=3, learning_rate=args.lr, apex=args.apex, initial_channels=args.initial_channels, depth=4,
         normalization=True, smooth_reg=1e-3, cyclic_reg=1e-2, ncc_window_size=5, load_optimizer=False,
-        group_index_list=[0, 1, 3, 5, 7, 9], fixed_disp_indexes=3, pair_disp_indexes=[0, 3],
-        pair_disp_calc_interval=50, stop_std=0.0007, stop_query_len=100,
+        group_index_list=[0, 1, 2, 3, 4, 5], fixed_disp_indexes=3, pair_disp_indexes=[0, 5],
+        pair_disp_calc_interval=50, stop_std=0.0004, stop_query_len=100,
         device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
     )
     config = util.Struct(**config)
