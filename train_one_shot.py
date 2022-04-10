@@ -2,43 +2,44 @@ import argparse
 import logging
 import os
 
+import SimpleITK as sitk
 import numpy as np
 # os.environ['CUDA_VISIBLE_DEVICES'] = "5"
 import tensorboardX
 import torch
 import tqdm
-from apex import amp
 
+# from apex import amp
 import util
-from loss import Get_Ja
-from util import CalTRE, write_loss, load_data, get_case, init_model
+from loss import jacboian_det
+from util import CalTRE, write_loss, load_data, get_case_demo, init_model
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 
 def main(args):
     torch.backends.cudnn.benchmark = True
-    case, crop_range, pixel_spacing = get_case(args.case_num)
-    # data_folder = f'../DataBase/Dirlab/case{case}/'
-    # landmark_file = f'../DataBase/Dirlab/case{case}/Case{case}_300_00_50.pt'
-    data_folder = f'/data/JY/Dirlab/case{case}/'
-    landmark_file = f'/data/JY/Dirlab/case{case}/Case{case}_300_00_50.pt'
+    case, crop_range, pixel_spacing = get_case_demo(args.case_num)
+    data_folder = f'../DataBase/Dirlab/case{case}/'
+    landmark_file = f'../DataBase/Dirlab/case{case}/Case{case}_300_00_50.pt'
+    # data_folder = f'/data/JY/Dirlab/case{case}/'
+    # landmark_file = f'/data/JY/Dirlab/case{case}/Case{case}_300_00_50.pt'
     states_folder = 'result'
     if not os.path.exists(states_folder):
         os.mkdir(states_folder)
+
     config = dict(
         train=not args.test, load=args.load, scale=args.scale, max_num_iteration=args.max_num_iteration,
         dim=3, learning_rate=args.lr, apex=args.apex, initial_channels=args.initial_channels, depth=4,
-        normalization=True, smooth_reg=1e-3, cyclic_reg=1e-2, ncc_window_size=5, load_optimizer=False,
-        group_index_list=[0, 1, 2, 3, 4, 5], fixed_disp_indexes=3, pair_disp_indexes=[0, 5],
-        pair_disp_calc_interval=50, stop_std=0.0004, stop_query_len=100,
+        normalization=True, smooth_reg=1e-3, jdet_reg=1e-3, ncc_window_size=5,
+        load_optimizer=False, group_index_list=[0, 1, 2, 3, 4, 5], fixed_disp_indexes=5,
+        pair_disp_calc_interval=50, stop_std=0.0007, stop_query_len=100,
         device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
     )
     config = util.Struct(**config)
 
     index = len([file for file in os.listdir(states_folder) if os.path.isdir(os.path.join(states_folder, file))])
-    model_name, Model = init_model('ucr_Attn')
-    states_file = model_name + f'_case{case}_{index:03d}' if not args.write_name else args.write_name + f'_case{case}_{index:03d}'
+    states_file = args.write_name + f'_case{case}_{index:03d}' if args.write_name else args.model + f'_case{case}_{index:03d}'
     train_writer = tensorboardX.SummaryWriter(os.path.join(states_folder, states_file)) if config.train else None
 
     # load_data
@@ -52,7 +53,6 @@ def main(args):
     landmark_info = torch.load(landmark_file)
     landmark_00 = landmark_info['landmark_00']
     landmark_50 = landmark_info['landmark_50']
-    # landmark_disp = landmark_info['disp_00_50'] if args.group else None
 
     grid_tuple = [np.arange(grid_length, dtype=np.float32) for grid_length in image_shape]
     landmark_00_converted = np.flip(landmark_00, axis=1) - np.array(
@@ -61,6 +61,8 @@ def main(args):
         [crop_range[0].start, crop_range[1].start, crop_range[2].start], dtype=np.float32)
 
     # 初始化训练模型
+    Model = init_model(args.model)
+
     regnet = Model(dim=config.dim, seq_len=len(config.group_index_list), config=config, scale=config.scale)
 
     regnet = regnet.to(config.device)
@@ -68,20 +70,18 @@ def main(args):
     if args.apex:
         regnet, regnet.optimizer = amp.initialize(regnet, regnet.optimizer, opt_level="O1")
 
-    Forward = regnet.pairwise_forward
-    Update = regnet.pairwise_update
-    Sample = regnet.pairwise_sample
-    Sample_Slice = regnet.pairwise_sample_slice
+    Forward = regnet.forward
+    Update = regnet.update
+    Sample = regnet.sample
 
     iter = regnet.load() if config.load else 0
-
     if config.train:
         diff_stats = []
         stop_criterion = util.StopCriterion(stop_std=config.stop_std, query_len=config.stop_query_len)
         pbar = tqdm.tqdm(range(config.max_num_iteration))
         for i in pbar:
-            if (i + 1) % 200 == 0:
-                Sample_Slice(input_image, os.path.join(states_folder, states_file), i)
+            if (i) % 200 == 0:
+                # Sample(input_image, os.path.join(states_folder, states_file), i)
                 states = {'model': regnet.state_dict()}
                 torch.save(states, os.path.join(states_folder, states_file + '.pth'))
                 logging.info(f'save model state {states_file} of iter {i}')
@@ -96,6 +96,11 @@ def main(args):
                 diff_stats.append([i, mean, std])
                 print(f'\ndiff: {mean:.2f}+-{std:.2f}({np.max(diff):.2f})')
 
+                flow = res['disp_t2i'].detach().cpu()  # .numpy()
+                jac = jacboian_det(flow).numpy()
+                exist = (jac < 0) * 1.0
+                print(f'jacobin < 0: {np.sum(exist) / jac.size * 100} %')
+
             simi_loss, smooth_loss, total_loss = Update(input_image)
 
             stop_criterion.add(simi_loss)
@@ -105,7 +110,7 @@ def main(args):
             write_loss(train_writer, simi_loss, smooth_loss, total_loss, mean, std, i + iter)
 
         res = Forward(input_image)
-        Sample_Slice(input_image, os.path.join(states_folder, states_file), 'best')
+        Sample(input_image, os.path.join(states_folder, states_file), 'best')
 
         # 训练结束，测试TRE
         flow = res['disp_t2i'][config.fixed_disp_indexes]
@@ -126,20 +131,26 @@ def main(args):
         regnet.eval()
         with torch.no_grad():
             res = Forward(input_image)
-            # Sample(input_image, config.load[:-4], 'test')
+            Sample(input_image, config.load[:-4], 'test')
 
             print('disp size:', res['disp_t2i'][config.fixed_disp_indexes].size())
             calTRE = CalTRE(grid_tuple, res['disp_t2i'][config.fixed_disp_indexes])
             mean, std, diff = calTRE.cal_disp(landmark_00_converted, landmark_50_converted, pixel_spacing)
 
             flow = res['disp_t2i'].detach().cpu()  # .numpy()
+            jac = jacboian_det(flow)
+            for index in range(6):
+                jac_array = jac[index, :, :, :].detach().cpu().numpy()
+                jac_array = sitk.GetImageFromArray(jac_array)
+                # vol_warped_image.SetSpacing([0.976, 0.976, 2.5])
+                sitk.WriteImage(jac_array, os.path.join('./result', f'jac_{index}.nii'))
 
-            lossFuc = Get_Ja()
-            jac = lossFuc.loss_3D(flow).numpy()
+            jac = jacboian_det(flow).numpy()
+            print(jac.shape)
             exist = (jac < 0) * 1.0
-            print(f'jacobin < 0: {np.sum(exist) / (6 * 89 * 163 * 230) * 100} %')
+            print(f'jacobin < 0: {np.sum(exist) / jac.size * 100} %')
 
-            torch.save(flow, 'result/disp_' + states_file + '.pth')
+            # torch.save(flow, 'result/disp_' + states_file + '.pth')
             print(f'\ndiff: {mean:.2f}+-{std:.2f}({np.max(diff):.2f})')
 
 
@@ -154,7 +165,7 @@ if __name__ == '__main__':
     parser.add_argument('--load', type=str, default=None, help='help')
     parser.add_argument('--test', action='store_true', default=False, help='train or test model')
     parser.add_argument('--apex', action='store_true', default=False, help='train or test model')
-    parser.add_argument('--model', type=str, default='lstm_se', help='model name')
+    parser.add_argument('--model', type=str, default='cat', help='model name')
     parser.add_argument('-name', '--write_name', type=str, default=None, help='name of saved model')
     args = parser.parse_args()
     main(args)

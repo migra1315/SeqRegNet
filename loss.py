@@ -6,7 +6,7 @@ torch.backends.cudnn.deterministic = True
 
 
 class NCC(nn.Module):
-    '''
+    """
     Calculate local normalized cross-correlation coefficient between tow images.
 
     Parameters
@@ -15,7 +15,7 @@ class NCC(nn.Module):
         Dimension of the input images.
     windows_size : int
         Side length of the square window to calculate the local NCC.
-    '''
+    """
 
     def __init__(self, dim, windows_size=11):
         super().__init__()
@@ -66,8 +66,67 @@ class NCC(nn.Module):
         return -torch.mean(cc)
 
 
+class Grad:
+    """
+    N-D gradient loss.
+    平滑损失
+    """
+
+    def __init__(self, penalty='l2', loss_mult=None):
+        self.penalty = penalty
+        self.loss_mult = loss_mult
+
+    def loss_2D(self, DvF):
+        '''
+        input:
+            DvF:[batch,dim,H,W],如[1,2,256,256]
+        method:
+            求y方向导数，并存储在矩阵中: DvF[:,0,:-1,:]-DvF[:,0,1:,:]
+            相当于dy = u(x+1,y) - u(x,y)
+            求x方向导数，并存储在矩阵中: DvF[:,1,:,:-1]-DvF[:,1,:,1:]
+            --------
+            各个坐标位置的梯度值求平方和(x**2+y**2)
+            忽略最后一行/列（分别缺少dx和dy），求均值
+        '''
+        dx = torch.abs(DvF[:, :, :, :-1] - DvF[:, :, :, 1:])
+        dy = torch.abs(DvF[:, :, :-1, :] - DvF[:, :, 1:, :])
+
+        if self.penalty == 'l2':
+            dx = torch.mul(dx, dx)
+            dy = torch.mul(dy, dy)
+
+        d = torch.mean(dx) + torch.mean(dy)
+        grad = d / 2.0
+        # d = torch.sqrt(dy[:,:,:,:-1]+dx[:,:,:-1,:])
+        # grad = torch.mean(d)/2.0
+
+        if self.loss_mult is not None:
+            grad *= self.loss_mult
+        return grad
+
+    def loss_3D(self, _, y_pred):
+        '''
+        有误未修正，后边用到参照2D方法修改
+        '''
+        dy = torch.abs(y_pred[:, :, 1:, :, :] - y_pred[:, :, :-1, :, :])
+        dx = torch.abs(y_pred[:, :, :, 1:, :] - y_pred[:, :, :, :-1, :])
+        dz = torch.abs(y_pred[:, :, :, :, 1:] - y_pred[:, :, :, :, :-1])
+
+        if self.penalty == 'l2':
+            dy = dy * dy
+            dx = dx * dx
+            dz = dz * dz
+
+        d = torch.mean(dx) + torch.mean(dy) + torch.mean(dz)
+        grad = d / 3.0
+
+        if self.loss_mult is not None:
+            grad *= self.loss_mult
+        return grad
+
+
 def smooth_loss(disp, image):
-    '''
+    """
     Calculate the smooth loss. Return mean of absolute or squared of the forward difference of  flow field.
 
     Parameters
@@ -77,7 +136,7 @@ def smooth_loss(disp, image):
 
     image : (n, 1, d, h, w) or (1, 1, d, h, w)
 
-    '''
+    """
 
     image_shape = disp.shape
     dim = len(image_shape[2:])
@@ -109,52 +168,31 @@ def smooth_loss(disp, image):
 def mse_loss(y_true, y_pred):
     return torch.mean((y_true - y_pred) ** 2)
 
-class Get_Ja():
 
-    def loss_2D(self, displacement):
-        '''
-        input:
-            displacement:形变场,[batch,channels,L,W],如[1,2,256,256]
-        methods:
-            计算形变场的在每个体素处的雅可比行列式,当:
-                Jac>1,扩张
-                Jac=1,不变
-                0<Jac<1,收缩
-                Jac<0,折叠
-            雅可比矩阵:                                                     雅可比行列式:
-            dux/dx = ux(x+1,y)-ux(x,y)  duy/dx = ux(x+1,y)-ux(x,y)          Jac = a11*a22-a12*a21
-            dux/dy = ux(x,y+1)-ux(x,y)  duy/dy = ux(x,y+1)-ux(x,y)              = dux/dx*duy/dy-duy/dx*dux/dy
-            需要注意的事项:
-            为了与物理意义对应,即Jac=1,不变.计算雅可比矩阵时,对角线元素应加1,即:Jac= (dux/dx+1)*(duy/dy+1)-duy/dx*dux/dy
-        output:
-            D:每个体素处的雅可比行列式,[batch,L-1,W-1],如[1,255,255].参照计算梯度的方法,最后1行/列无梯度,故返回L-1,W-1
-        '''
-        D_y = (displacement[:, :, 1:, :-1] - displacement[:, :, :-1, :-1])
-        D_x = (displacement[:, :, :-1, 1:] - displacement[:, :, :-1, :-1])
+def jacboian_det(displacement):
+    """
+    input:
+        displacement:[batch,channels,L,W,D],如[1,3,256,256,96]
+        之后permute成1,256,256,96,3
+    methods:
+        参见2D
+    """
+    displacement = displacement.permute(0, 2, 3, 4, 1)
 
-        D1 = (D_x[:, 0, :, :] + 1) * (D_y[:, 1, :, :] + 1)
-        D2 = D_y[:, 0, :, :] * D_x[:, 1, :, :]
-        D = D1 - D2
-        return D
+    D_y = (displacement[:, 1:, :-1, :-1, :] - displacement[:, :-1, :-1, :-1, :])
+    D_x = (displacement[:, :-1, 1:, :-1, :] - displacement[:, :-1, :-1, :-1, :])
+    D_z = (displacement[:, :-1, :-1, 1:, :] - displacement[:, :-1, :-1, :-1, :])
 
-    def loss_3D(self, displacement):
-        '''
-        input:
-            displacement:[batch,channels,L,W,D],如[1,3,256,256,96]
-            之后permute成1,256,256,96,3
-        methods:
-            参见2D
-        '''
-        displacement = displacement.permute(0, 2, 3, 4, 1)
+    D1 = (D_x[..., 0] + 1) * ((D_y[..., 1] + 1) * (D_z[..., 2] + 1) - D_y[..., 2] * D_z[..., 1])
+    D2 = (D_x[..., 1]) * (D_y[..., 0] * (D_z[..., 2] + 1) - D_y[..., 2] * D_z[..., 0])
+    D3 = (D_x[..., 2]) * (D_y[..., 0] * D_z[..., 1] - (D_y[..., 1] + 1) * D_z[..., 0])
 
-        D_y = (displacement[:, 1:, :-1, :-1, :] - displacement[:, :-1, :-1, :-1, :])
-        D_x = (displacement[:, :-1, 1:, :-1, :] - displacement[:, :-1, :-1, :-1, :])
-        D_z = (displacement[:, :-1, :-1, 1:, :] - displacement[:, :-1, :-1, :-1, :])
+    D = D1 - D2 + D3
 
-        D1 = (D_x[..., 0] + 1) * ((D_y[..., 1] + 1) * (D_z[..., 2] + 1) - D_y[..., 2] * D_z[..., 1])
-        D2 = (D_x[..., 1]) * (D_y[..., 0] * (D_z[..., 2] + 1) - D_y[..., 2] * D_z[..., 0])
-        D3 = (D_x[..., 2]) * (D_y[..., 0] * D_z[..., 1] - (D_y[..., 1] + 1) * D_z[..., 0])
+    return D
 
-        D = D1 - D2 + D3
 
-        return D
+def neg_jdet_loss(displacement):
+    neg_jdet = -1.0 * jacboian_det(displacement)
+    selected_neg_jdet = F.relu(neg_jdet)
+    return torch.mean(selected_neg_jdet)

@@ -3,541 +3,62 @@ import os
 import SimpleITK as sitk
 import torch
 import torch.nn.functional as F
-from apex import amp
+# from apex import amp
 from torch import nn
-from torchvision import utils as vutils
 
 import loss
 import util
+from baseModule import UlstmCatSkipConnect, CRNet
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, padding, bias, normalization=True, LeakyReLU_slope=0.2):
-        super().__init__()
-        block = []
-        block.append(nn.Conv3d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size,
-                               padding=padding, bias=bias))
-        if normalization:
-            block.append(nn.InstanceNorm3d(out_channels))
-        block.append(nn.LeakyReLU(LeakyReLU_slope))
-        self.block = nn.Sequential(*block)
-
-    def forward(self, x):
-        out = self.block(x)
-        return out
-
-
-class ConvLSTMCell(nn.Module):
-
-    def __init__(self, input_dim, hidden_dim, kernel_size, bias, normalization=True):
-        """
-        Initialize ConvLSTM cell.
-        Parameters
-        ----------
-        input_dim: int
-            Number of channels of input tensor.
-        hidden_dim: int
-            Number of channels of hidden state.
-        kernel_size: (int, int)
-            Size of the convolutional kernel.
-        bias: bool
-            Whether or not to add the bias.
-        """
-
-        super(ConvLSTMCell, self).__init__()
-
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.normalization = normalization
-        self.kernel_size = kernel_size
-        self.padding = kernel_size[0] // 2, kernel_size[1] // 2, kernel_size[2] // 2
-        self.bias = bias
-        self.conv = ConvBlock(in_channels=self.input_dim + self.hidden_dim,
-                              out_channels=4 * self.hidden_dim,
-                              kernel_size=self.kernel_size,
-                              padding=self.padding,
-                              bias=self.bias,
-                              normalization=self.normalization)
-
-    def forward(self, input_tensor, cur_state):
-        h_cur, c_cur = cur_state
-        combined = torch.cat([input_tensor, h_cur], dim=1)  # concatenate along channel axis
-
-        combined_conv = self.conv(combined)
-        cc_i, cc_f, cc_o, cc_g = torch.split(combined_conv, self.hidden_dim, dim=1)
-        i = torch.sigmoid(cc_i)
-        f = torch.sigmoid(cc_f)
-        o = torch.sigmoid(cc_o)
-        g = torch.tanh(cc_g)
-
-        c_next = f * c_cur + i * g
-        h_next = o * torch.tanh(c_next)
-
-        return h_next, c_next
-
-    def init_hidden(self, batch_size, image_size):
-        height, width, depth = image_size
-        return (torch.zeros(batch_size, self.hidden_dim, height, width, depth,
-                            dtype=self.conv.block[0].weight.dtype, device=self.conv.block[0].weight.device),
-                torch.zeros(batch_size, self.hidden_dim, height, width, depth,
-                            dtype=self.conv.block[0].weight.dtype, device=self.conv.block[0].weight.device))
-
-
-class ConvLSTM(nn.Module):
+class VecInt(nn.Module):
     """
-        Parameters:
-            input_dim: Number of channels in input
-            hidden_dim: Number of hidden channels
-            kernel_size: Size of kernel in convolutions
-            num_layers: Number of LSTM layers stacked on each other
-            batch_first: Whether or not dimension 0 is the batch or not
-            bias: Bias or no bias in Convolution
-            return_all_layers: Return the list of computations for all layers
-            Note: Will do same padding.
-        Input:
-            A tensor of size B, T, C, H, W or T, B, C, H, W
-        Output:
-            A tuple of two lists of length num_layers (or length 1 if return_all_layers is False).
-                0 - layer_output_list is the list of lists of length T of each output
-                1 - last_state_list is the list of last states
-                        each element of the list is a tuple (h, c) for hidden state and memory
-        Example:
-            >> x = torch.rand((32, 10, 64, 128, 128))
-            >> convlstm = ConvLSTM(64, 16, 3, 1, True, True, False)
-            >> _, last_states = convlstm(x)
-            >> h = last_states[0][0]  # 0 for layer index, 0 for h index
+    Integrates a vector field via scaling and squaring.
     """
 
-    def __init__(self, input_dim, hidden_dim, kernel_size, num_layers=1,
-                 batch_first=True, bias=True, normalization=True, return_all_layers=False):
-        super(ConvLSTM, self).__init__()
-
-        self._check_kernel_size_consistency(kernel_size)
-
-        # Make sure that both `kernel_size` and `hidden_dim` are lists having len == num_layers
-        kernel_size = self._extend_for_multilayer(kernel_size, num_layers)
-        hidden_dim = self._extend_for_multilayer(hidden_dim, num_layers)
-        if not len(kernel_size) == len(hidden_dim) == num_layers:
-            raise ValueError('Inconsistent list length.')
-
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.kernel_size = kernel_size
-        self.num_layers = num_layers
-        self.batch_first = batch_first
-        self.bias = bias
-        self.return_all_layers = return_all_layers
-        self.normalization = normalization
-        cell_list = []
-        for i in range(0, self.num_layers):
-            cur_input_dim = self.input_dim if i == 0 else self.hidden_dim[i - 1]
-
-            cell_list.append(ConvLSTMCell(input_dim=cur_input_dim,
-                                          hidden_dim=self.hidden_dim[i],
-                                          kernel_size=self.kernel_size[i],
-                                          bias=self.bias,
-                                          normalization=self.normalization))
-
-        self.cell_list = nn.ModuleList(cell_list)
-
-    def forward(self, input_tensor, hidden_state=None):
-        """
-        Parameters
-        ----------
-        input_tensor: todo
-            6-D Tensor either of shape (t, b, c, h, w, d) or (b, t, c, h, w, d)
-        hidden_state: todo
-            None. todo implement stateful
-        Returns
-        -------
-        last_state_list, layer_output
-        """
-        if not self.batch_first:
-            # (t, b, c, h, w, d) -> (b, t, c, h, w, d)
-            input_tensor = input_tensor.permute(1, 0, 2, 3, 4, 5)
-        b, _, _, h, w, d = input_tensor.size()
-
-        '''
-        初始化一个长度为num_layers的list
-        '''
-        # Implement stateful ConvLSTM
-        if hidden_state is not None:
-            raise NotImplementedError()
-        else:
-            # Since the init is done in forward. Can send image size here
-            hidden_state = self._init_hidden(batch_size=b,
-                                             image_size=(h, w, d))
-
-        seq_len = input_tensor.size(1)
-        h, c = hidden_state[0]
-        output_inner = []
-        # 逐序列的进行卷积运算
-        for t in range(seq_len):
-            h, c = self.cell_list[0](input_tensor=input_tensor[:, t, :, :, :, :],
-                                     cur_state=[h, c])
-            output_inner.append(h)
-        layer_output = torch.stack(output_inner, dim=1)
-        return layer_output
-
-    def _init_hidden(self, batch_size, image_size):
-        init_states = []
-        for i in range(self.num_layers):
-            init_states.append(self.cell_list[i].init_hidden(batch_size, image_size))
-        return init_states
-
-    @staticmethod
-    def _check_kernel_size_consistency(kernel_size):
-        if not (isinstance(kernel_size, tuple) or
-                (isinstance(kernel_size, list) and all([isinstance(elem, tuple) for elem in kernel_size]))):
-            raise ValueError('`kernel_size` must be tuple or list of tuples')
-
-    @staticmethod
-    def _extend_for_multilayer(param, num_layers):
-        if not isinstance(param, list):
-            param = [param] * num_layers
-        return param
-
-
-class ConvFormer(nn.Module):
-    def __init__(self, in_channels, out_channels, position_embedding_size, kernel_size=(3, 3, 3), padding=(1, 1, 1)):
-        super(ConvFormer, self).__init__()
-        self.conv_q = ConvBlock(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=True)
-        self.conv_k = ConvBlock(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=True)
-        self.conv_v = ConvBlock(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=True)
-        self.attention = Attn(out_channels, out_channels)
-        self.conv_forward = ConvBlock(out_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=True)
-        # nn.Conv3d(out_channels, out_channels, kernel_size=(1, 1, 1))
-        # self.position_embedding = nn.Parameter(torch.zeros(position_embedding_size))
-
-        self.active_relu = nn.ReLU()
-        self.active_sigmoid = nn.Sigmoid()
-
-    def forward(self, c, e):
-        queries = []
-        keys = []
-        values = []
-        time_length = e.size()[1]
-        # c = c + self.position_embedding
-        # e = e + self.position_embedding
-        for time_index in range(time_length):
-            q = self.conv_q(e[:, time_index, :])
-            k = self.conv_k(c[:, time_index, :])
-            v = self.conv_v(c[:, time_index, :])
-            queries.append(q)
-            keys.append(k)
-            values.append(v)
-        outs = []
-        for queries_index in range(time_length):
-            out = torch.zeros_like(values[queries_index])
-            for keys_index in range(time_length):
-                out += self.attention(queries[queries_index], keys[keys_index]) \
-                       * values[keys_index]
-            out = self.conv_forward(out + queries[queries_index])
-            outs.append(out)
-        return torch.stack(outs, dim=1)
-
-
-class Attn(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(Attn, self).__init__()
-
-        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=(1, 1, 1))
-        self.conv2 = nn.Conv3d(in_channels, out_channels, kernel_size=(1, 1, 1))
-        self.conv3 = nn.Conv3d(in_channels, out_channels, kernel_size=(1, 1, 1))
-        self.active_relu = nn.ReLU()
-        self.active_sigmoid = nn.Sigmoid()
-
-    def forward(self, c, p):
-        out = self.conv3(self.active_relu(self.conv1(c) + self.conv2(p)))
-        scale = self.active_sigmoid(out)
-        # out = scale * p + c
-        # out = torch.cat((scale * p, c), dim=1)
-
-        return scale
-
-
-class DownConvLSTMBlock(nn.Module):
-    def __init__(self, input_channels, hidden_channels, kernel_size):
+    def __init__(self, dim, nsteps):
         super().__init__()
-        self.block = ConvLSTM(input_channels, hidden_channels, kernel_size)
 
-    def forward(self, x):
-        x = self.block(x)
-        x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
-                          recompute_scale_factor=True)
-        return x.unsqueeze(0)
+        assert nsteps >= 0, 'nsteps should be >= 0, found: %d' % nsteps
+        self.nsteps = nsteps
+        self.scale = 1.0 / (2 ** self.nsteps)
+        self.transformer = SpatialTransformer(dim)
+
+    def forward(self, vec):
+        vec = vec * self.scale
+        for _ in range(self.nsteps):
+            vec = vec + self.transformer(vec, vec)
+        return vec
 
 
-class UpConvLSTMBlock(nn.Module):
-    def __init__(self, input_channels, hidden_channels, kernel_size):
+class ResizeTransform(nn.Module):
+    """
+    Resize a transform, which involves resizing the vector field *and* rescaling it.
+    """
+
+    def __init__(self, vel_resize, ndims):
         super().__init__()
-        self.block1 = ConvLSTM(input_channels, hidden_channels, kernel_size)
-        # self.atten =ConvFormer(in_channels=hidden_channels, out_channels=hidden_channels, position_embedding_size=None)
-        self.block2 = ConvLSTM(input_channels, hidden_channels, kernel_size)
-
-    def forward(self, x, skip):
-        x = self.block1(x)
-        skip = F.interpolate(skip.squeeze(0), size=x.size()[3:], mode='trilinear', align_corners=True).unsqueeze(0)
-        x = torch.cat([x, skip], dim=2)
-        x = self.block2(x)
-        # x = self.atten(x,skip)
-        x = F.interpolate(x.squeeze(0), scale_factor=2, mode='trilinear', align_corners=True,
-                          recompute_scale_factor=True)
-        return x.unsqueeze(0)
-
-
-class Ulstm_cat(nn.Module):
-    def __init__(self, input_channels, output_channels, initial_channels, depth=4, kernel_size=(3, 3, 3)):
-        super(Ulstm_cat, self).__init__()
-        self.depth = depth
-        prev_channels = input_channels
-        self.down_path = nn.ModuleList()
-        for i in range(self.depth):
-            current_channels = 2 ** i * initial_channels
-            self.down_path.append(DownConvLSTMBlock(input_channels=prev_channels, hidden_channels=current_channels,
-                                                    kernel_size=kernel_size))
-            prev_channels = current_channels
-
-        self.up_path = nn.ModuleList()
-        for i in reversed(range(self.depth - 1)):
-            current_channels = 2 ** i * initial_channels
-            self.up_path.append(UpConvLSTMBlock(input_channels=prev_channels, hidden_channels=current_channels,
-                                                kernel_size=kernel_size))
-            prev_channels = current_channels
-        self.last = ConvLSTM(prev_channels, 3, kernel_size)
+        self.factor = 1.0 / vel_resize
+        self.mode = 'linear'
+        if ndims == 2:
+            self.mode = 'bi' + self.mode
+        elif ndims == 3:
+            self.mode = 'tri' + self.mode
 
     def forward(self, x):
-        blocks = []
-        in_size = x.size()[3:]
-        for i, down in enumerate(self.down_path):
-            x = down(x)
-            if i < self.depth - 1:
-                blocks.append(x)
-        for i, up in enumerate(self.up_path):
-            x = up(x, blocks[-i - 1])
-            # print(x.size(),blocks[-i-1].size())
-        x = self.last(x)
-        x = F.interpolate(x.squeeze(0), size=in_size, mode='trilinear', align_corners=True).unsqueeze(0)
-        return x
+        if self.factor < 1:
+            # resize first to save memory
+            x = F.interpolate(x, scale_factor=self.factor, mode=self.mode, align_corners=True,
+                              recompute_scale_factor=True)
+            x = self.factor * x
 
+        elif self.factor > 1:
+            # multiply first to save memory
+            x = self.factor * x
+            x = F.interpolate(x, scale_factor=self.factor, mode=self.mode, align_corners=True,
+                              recompute_scale_factor=True)
 
-class Ulstm(nn.Module):
-    def __init__(self):
-        super(Ulstm, self).__init__()
-        self.down_conv = ConvBlock(in_channels=1, out_channels=16,
-                                   kernel_size=(3, 3, 3), padding=1, bias=True)
-        self.down_1 = ConvLSTM(input_dim=16, hidden_dim=32, kernel_size=(3, 3, 3))
-        self.down_2 = ConvLSTM(input_dim=32, hidden_dim=64, kernel_size=(3, 3, 3))
-        self.down_3 = ConvLSTM(input_dim=64, hidden_dim=128, kernel_size=(3, 3, 3))
-        self.up_3 = ConvLSTM(input_dim=128, hidden_dim=64, kernel_size=(3, 3, 3))
-        self.up_2 = ConvLSTM(input_dim=64, hidden_dim=32, kernel_size=(3, 3, 3))
-        self.up_1 = ConvLSTM(input_dim=32, hidden_dim=16, kernel_size=(3, 3, 3))
-        self.up_conv = nn.Conv3d(in_channels=16, out_channels=3, kernel_size=(3, 3, 3), padding=1)
-        self.attn_1 = Attn(in_channels=64, out_channels=64)
-        self.attn_2 = Attn(in_channels=32, out_channels=32)
-
-    def attn(self, x, y):
-        return (x + y) / 2
-
-    def forward(self, x):
-        embedding_list = []
-        # 需求input [n, 1, 48, 128, 128]
-        seq_len = x.size()[0]
-        image_shape = x.size()[2:]
-        for index in range(seq_len):
-            embedding = self.down_conv(x[index:index + 1, :])
-            embedding_list.append(embedding)
-        embedding = torch.stack(embedding_list, dim=1)
-        del embedding_list
-
-        down_list = []
-        x = self.down_1(embedding)
-        del embedding
-        x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False)
-        down_list.append(x)
-        x = self.down_2(x.unsqueeze(0))
-        x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False)
-        down_list.append(x)
-        x = self.down_3(x.unsqueeze(0))
-        x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False)
-
-        x = self.up_3(x.unsqueeze(0))
-        x = F.interpolate(x.squeeze(0), size=down_list[1].size()[2:], mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False)
-
-        x = self.attn_1(x, down_list[1])
-        # x = self.attn(x, down_list[1])
-        x = self.up_2(x.unsqueeze(0))
-        x = F.interpolate(x.squeeze(0), size=down_list[0].size()[2:], mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False)
-
-        x = self.attn_2(x, down_list[0])
-        # x = self.attn(x, down_list[0])
-        x = self.up_1(x.unsqueeze(0))
-        x = F.interpolate(x.squeeze(0), scale_factor=2, mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False)
-
-        disp_list = []
-        for index in range(seq_len):
-            disp = self.up_conv(x[index:index + 1, :])
-            disp_list.append(disp)
-        disp = torch.stack(disp_list, dim=1).squeeze(0)
-        del x
-        del disp_list
-        disp = F.interpolate(disp, size=image_shape, mode='trilinear', align_corners=True, recompute_scale_factor=False)
-        return disp
-
-
-class Ulstm_Conv_Former(nn.Module):
-    def __init__(self):
-        super(Ulstm_Conv_Former, self).__init__()
-        self.down_conv = ConvBlock(in_channels=1, out_channels=16,
-                                   kernel_size=(3, 3, 3), padding=1, bias=True)
-        self.down_1 = ConvLSTM(input_dim=16, hidden_dim=32, kernel_size=(3, 3, 3))
-        self.down_2 = ConvLSTM(input_dim=32, hidden_dim=64, kernel_size=(3, 3, 3))
-        self.down_3 = ConvLSTM(input_dim=64, hidden_dim=128, kernel_size=(3, 3, 3))
-        self.up_3 = ConvLSTM(input_dim=128, hidden_dim=64, kernel_size=(3, 3, 3))
-        self.up_20 = ConvLSTM(input_dim=128, hidden_dim=64, kernel_size=(3, 3, 3))
-        self.up_21 = ConvLSTM(input_dim=64, hidden_dim=32, kernel_size=(3, 3, 3))
-        self.up_10 = ConvLSTM(input_dim=64, hidden_dim=32, kernel_size=(3, 3, 3))
-        self.up_11 = ConvLSTM(input_dim=32, hidden_dim=16, kernel_size=(3, 3, 3))
-        self.up_conv = nn.Conv3d(in_channels=16, out_channels=3, kernel_size=(3, 3, 3), padding=(1, 1, 1))
-        self.attn_1 = ConvFormer(in_channels=64, out_channels=128, position_embedding_size=[1, 6, 64, 9, 25, 25])
-        self.attn_2 = ConvFormer(in_channels=32, out_channels=64, position_embedding_size=[1, 6, 32, 19, 51, 51])
-
-    def forward(self, x):
-        embedding_list = []
-        # 需求input [n, 1, 48, 128, 128]
-        seq_len = x.size()[0]
-        image_shape = x.size()[2:]
-        for index in range(seq_len):
-            embedding = self.down_conv(x[index:index + 1, :])
-            embedding_list.append(embedding)
-        x = torch.stack(embedding_list, dim=1)
-        del embedding_list
-
-        down_list = []
-        x = self.down_1(x)
-        x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False).unsqueeze(0)
-        down_list.append(x)
-        x = self.down_2(x)
-        x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False).unsqueeze(0)
-        down_list.append(x)
-        x = self.down_3(x)
-        x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False).unsqueeze(0)
-
-        x = self.up_3(x)
-        x = F.interpolate(x.squeeze(0), size=down_list[1].size()[3:], mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False).unsqueeze(0)
-
-        # print("attn1 size:", x.size())
-        x = self.attn_1(x, down_list[1])
-        x = self.up_21(self.up_20(x))
-        x = F.interpolate(x.squeeze(0), size=down_list[0].size()[3:], mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False).unsqueeze(0)
-
-        # print("attn2 size:", x.size())
-        x = self.attn_2(x, down_list[0])
-        x = self.up_11(self.up_10(x))
-        x = F.interpolate(x.squeeze(0), scale_factor=2, mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False)
-
-        disp_list = []
-        for index in range(seq_len):
-            disp = self.up_conv(x[index:index + 1, :])
-            disp_list.append(disp)
-        x = torch.stack(disp_list, dim=1).squeeze(0)
-        x = F.interpolate(x, size=image_shape, mode='trilinear', align_corners=True, recompute_scale_factor=False)
-        return x
-
-
-class UlstmCatSkipConnect(nn.Module):
-    def __init__(self):
-        super(UlstmCatSkipConnect, self).__init__()
-        self.down_conv = ConvBlock(in_channels=1, out_channels=16,
-                                   kernel_size=(3, 3, 3), padding=1, bias=True)
-        self.down_1 = ConvLSTM(input_dim=16, hidden_dim=32, kernel_size=(3, 3, 3))
-        self.down_2 = ConvLSTM(input_dim=32, hidden_dim=64, kernel_size=(3, 3, 3))
-        self.down_3 = ConvLSTM(input_dim=64, hidden_dim=128, kernel_size=(3, 3, 3))
-
-        self.up_30 = ConvLSTM(input_dim=128, hidden_dim=64, kernel_size=(3, 3, 3))
-        self.up_31 = ConvLSTM(input_dim=64, hidden_dim=64, kernel_size=(3, 3, 3))
-
-        self.up_20 = ConvLSTM(input_dim=128, hidden_dim=64, kernel_size=(3, 3, 3))
-        self.up_21 = ConvLSTM(input_dim=64, hidden_dim=32, kernel_size=(3, 3, 3))
-
-        self.up_10 = ConvLSTM(input_dim=64, hidden_dim=32, kernel_size=(3, 3, 3))
-        self.up_11 = ConvLSTM(input_dim=32, hidden_dim=16, kernel_size=(3, 3, 3))
-
-        self.up_conv = nn.Conv3d(in_channels=16, out_channels=3, kernel_size=(3, 3, 3), padding=1)
-        self.attn_1 = Attn(in_channels=64, out_channels=64)
-        self.attn_2 = Attn(in_channels=32, out_channels=32)
-
-    def forward(self, x):
-        embedding_list = []
-        # 需求input [6, 1, 48, 128, 128]
-        seq_len = x.size()[0]
-        image_shape = x.size()[2:]
-        for index in range(seq_len):
-            embedding = self.down_conv(x[index:index + 1, :])
-            embedding_list.append(embedding)
-        x = torch.stack(embedding_list, dim=1)
-
-        del embedding_list
-
-        down_list = []
-        x = self.down_1(x)
-        x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False)
-
-        down_list.append(x)
-        x = self.down_2(x.unsqueeze(0))
-        x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False)
-        down_list.append(x)
-        x = self.down_3(x.unsqueeze(0))
-        x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False)
-
-        x = self.up_30(x.unsqueeze(0))
-        x = self.up_31(x)
-
-        x = F.interpolate(x.squeeze(0), size=down_list[1].size()[2:], mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False)
-
-        x = torch.cat((x, down_list[1]), dim=1)
-
-        x = self.up_20(x.unsqueeze(0))
-
-        x = self.up_21(x)
-
-        x = F.interpolate(x.squeeze(0), size=down_list[0].size()[2:], mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False)
-
-        x = torch.cat((x, down_list[0]), dim=1)
-
-        x = self.up_10(x.unsqueeze(0))
-        # print('up_10:', x.size())
-
-        x = self.up_11(x)
-
-        x = F.interpolate(x.squeeze(0), scale_factor=2, mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False)
-
-        disp_list = []
-        for index in range(seq_len):
-            disp = self.up_conv(x[index:index + 1, :])
-            disp_list.append(disp)
-        x = torch.stack(disp_list, dim=1).squeeze(0)
-
-        x = F.interpolate(x, size=image_shape, mode='trilinear', align_corners=True,
-                          recompute_scale_factor=False)
+        # don't do anything if resize is 1
         return x
 
 
@@ -604,138 +125,39 @@ class RegNet(nn.Module):
         self.seq_len = seq_len
         self.scale = scale
         self.config = config
-        # self.unet = Ulstm()
-        # self.unet = UlstmCatSkipConnect()
-        self.unet = Ulstm_Conv_Former()
 
+        self.unet = UlstmCatSkipConnect()
+        self.resize = ResizeTransform(2, 3)
+        self.fullsize = ResizeTransform(1 / 2, 3)
+        self.vecInt = VecInt(dim=3, nsteps=7)
         self.spatial_transform = SpatialTransformer(self.dim)
-        self.ncc_loss = loss.NCC(self.config.dim, self.config.ncc_window_size)
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config.learning_rate, eps=1e-3)
         self.calcdisp = util.CalcDisp(dim=self.config.dim, calc_device=config.device)
-        self.description()
-        '''
-    
-        def forward(self, input_image):
-            original_image_shape = input_image.shape[2:]  # d, h, w
-            # input : [6, 1, 96, 256, 256]
-            # 下采样至1/2
-            if self.scale < 1:
-                scaled_image = F.interpolate(input_image, scale_factor=self.scale, align_corners=True,
-                                             mode='bilinear' if self.dim == 2 else 'trilinear',
-                                             recompute_scale_factor=False)  # (1, n, h, w) or (1, n, d, h, w)
-            else:
-                scaled_image = input_image
-            # scaled_image : [6, 1, 48, 128, 128]
-    
-            scaled_image_shape = scaled_image.shape[2:]
-            scaled_disp_t2i = self.unet(scaled_image)
-            # scaled_disp_t2i: [6, 3, 48, 128, 128]
-    
-            if self.scale < 1:
-                disp_t2i = F.interpolate(scaled_disp_t2i, size=original_image_shape,
-                                         mode='bilinear' if self.dim == 2 else 'trilinear', align_corners=True)
-            else:
-                disp_t2i = scaled_disp_t2i
-            # disp_t2i: [6, 3, 96, 256, 256]
-    
-            warped_input_image = self.spatial_transform(input_image, disp_t2i)
-            # [6, 1, 96, 256, 256] @ [6, 3, 96, 256, 256] = [6, 1, 96, 256, 256]
-            template = torch.mean(warped_input_image, 0, keepdim=True)  # [1, 1, 96, 256, 256]
-    
-            if self.scale < 1:
-                scaled_template = F.interpolate(template, size=scaled_image_shape,
-                                                mode='bilinear' if self.dim == 2 else 'trilinear', align_corners=True)
-            else:
-                scaled_template = template
-            res = {'disp_t2i': disp_t2i, 'scaled_disp_t2i': scaled_disp_t2i, 'warped_input_image': warped_input_image,
-                   'template': template, 'scaled_template': scaled_template}
-            return res
-    
-        def update(self, input_image):
-            self.optimizer.zero_grad()
-            res = self.forward(input_image)
-            total_loss = 0.
-            if 'disp_i2t' in res:
-                simi_loss = (self.ncc_loss(res['warped_input_image'], res['template']) + self.ncc_loss(input_image, res[
-                    'warped_template'])) / 2.
-            else:
-                simi_loss = self.ncc_loss(res['warped_input_image'], res['template'])
-            total_loss += simi_loss
-    
-            if self.config.smooth_reg > 0:
-                if 'disp_i2t' in res:
-                    smooth_loss = (loss.smooth_loss(res['scaled_disp_t2i']) + loss.smooth_loss(res['scaled_disp_i2t'])) / 2.
-                else:
-                    smooth_loss = loss.smooth_loss(res['scaled_disp_t2i'], res['scaled_template'])
-                total_loss += self.config.smooth_reg * smooth_loss
-                smooth_loss_item = smooth_loss.item()
-            else:
-                smooth_loss_item = 0
-    
-            if self.config.cyclic_reg > 0:
-                if 'disp_i2t' in res:
-                    cyclic_loss = ((torch.mean((torch.sum(res['scaled_disp_t2i'], 0)) ** 2)) ** 0.5 + (
-                        torch.mean((torch.sum(res['scaled_disp_i2t'], 0)) ** 2)) ** 0.5) / 2.
-                else:
-                    cyclic_loss = (torch.mean((torch.sum(res['scaled_disp_t2i'], 0)) ** 2)) ** 0.5
-                total_loss += self.config.cyclic_reg * cyclic_loss
-                cyclic_loss_item = cyclic_loss.item()
-            else:
-                cyclic_loss_item = 0
-    
-            total_loss.backward()
-            self.optimizer.step()
-    
-            return simi_loss.item(), smooth_loss_item, cyclic_loss_item, total_loss.item()
-    
-        def sample(self, input_image, path, iter):
-            with torch.no_grad():
-                res = self.forward(input_image)
-                for index in range(res['warped_input_image'].size()[0]):
-                    arr = res['warped_input_image'][index, :, :, :, :].detach().squeeze(0).cpu().numpy()
-                    vol = sitk.GetImageFromArray(arr)
-                    sitk.WriteImage(vol, os.path.join(path, f'warp_{iter}_{index}.nii'))
-    
-                for index in range(res['disp_t2i'].size()[0]):  # 10,3,83,157,240
-                    arr = res['disp_t2i'][index, :, :, :, :].detach().squeeze(0).permute(1, 2, 3, 0).cpu().numpy()
-                    vol = sitk.GetImageFromArray(arr)
-                    sitk.WriteImage(vol, os.path.join(path, f'disp_{iter}_{index}.nii'))
-    
-                arr = res['template'].detach().squeeze(0).squeeze(0).cpu().numpy()
-                vol = sitk.GetImageFromArray(arr)
-                sitk.WriteImage(vol, os.path.join(path, f'tmp.nii'))
-    
-        def sample_slice(self, input_image, path, iter):
-            with torch.no_grad():
-                res = self.forward(input_image)
-                for index in range(res['warped_input_image'].size()[0]):
-                    arr = res['warped_input_image'][index, :, :, :, :].detach().squeeze(0)  # 83,157,240
-                    slice = arr[30, :, :]
-                    vutils.save_image(slice.data, os.path.join(path, f'warp_{iter}_{index}.png'), padding=0, normalize=True)
-        '''
 
-    def pairwise_forward(self, input_image):
+        self.ncc_loss = loss.NCC(self.config.dim, self.config.ncc_window_size)
+        self.grad = loss.Grad(penalty='l2', loss_mult=2).loss_2D
+
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config.learning_rate, eps=1e-3)
+        self.description()
+
+    def forward(self, input_image):
 
         original_image_shape = input_image.shape[2:]
         # input_image: [6, 1, 96, 256, 256]
         # 下采样至1/2
-        if self.scale < 1:
-            scaled_image = F.interpolate(input_image, scale_factor=self.scale,
-                                         align_corners=True, mode='bilinear' if self.dim == 2 else 'trilinear',
-                                         recompute_scale_factor=False)  # (1, n, h, w) or (1, n, d, h, w)
-        else:
-            scaled_image = input_image
-        # scaled_image: [6, 1, 48, 128, 128]
+        scaled_image = F.interpolate(input_image, scale_factor=self.scale,
+                                     align_corners=True, mode='bilinear' if self.dim == 2 else 'trilinear',
+                                     recompute_scale_factor=False)  # (1, n, h, w) or (1, n, d, h, w)
 
         scaled_image_shape = scaled_image.shape[2:]
         scaled_disp_t2i = self.unet(scaled_image)
+        # scaled_flow_t2i = self.unet(scaled_image)
+        # scaled_flow_t2i = self.resize(scaled_flow_t2i)
+        # scaled_disp_t2i = self.vecInt(scaled_flow_t2i)
+        # scaled_flow_t2i = self.fullsize(scaled_flow_t2i)
         # scaled_disp_t2i: [6, 3, 48, 128, 128]
 
-        if self.scale < 1:
-            disp_t2i = F.interpolate(scaled_disp_t2i, size=original_image_shape,
-                                     mode='bilinear' if self.dim == 2 else 'trilinear', align_corners=True)
-        else:
-            disp_t2i = scaled_disp_t2i
+        disp_t2i = F.interpolate(scaled_disp_t2i, size=original_image_shape,
+                                 mode='bilinear' if self.dim == 2 else 'trilinear', align_corners=True)
         # disp_t2i: [6, 3, 96, 256, 256]
 
         moving_image = input_image[0:1, :, :, :, :].repeat(self.seq_len, 1, 1, 1, 1)
@@ -743,28 +165,33 @@ class RegNet(nn.Module):
         warped_input_image = self.spatial_transform(moving_image, disp_t2i)
         # [6, 1, 96, 256, 256] @ [6, 3, 96, 256, 256] = [6, 1, 96, 256, 256]
 
-        if self.scale < 1:
-            scaled_warped_input_image = F.interpolate(warped_input_image, size=scaled_image_shape,
-                                                      mode='bilinear' if self.dim == 2 else 'trilinear',
-                                                      align_corners=True)
-        else:
-            scaled_warped_input_image = warped_input_image
+        scaled_warped_input_image = F.interpolate(warped_input_image, size=scaled_image_shape,
+                                                  mode='bilinear' if self.dim == 2 else 'trilinear',
+                                                  align_corners=True)
+
         # scaled_warped_input_image: [6, 1, 48, 128, 128]
 
-        res = {'disp_t2i': disp_t2i, 'scaled_disp_t2i': scaled_disp_t2i, 'warped_input_image': warped_input_image,
-               'scaled_warped_input_image': scaled_warped_input_image, 'moving_image': input_image[0, :, :, :, :]}
+        # res = {'disp_t2i': disp_t2i, 'scaled_disp_t2i': scaled_disp_t2i, 'warped_input_image': warped_input_image,
+        #        'scaled_warped_input_image': scaled_warped_input_image, 'moving_image': input_image[0, :, :, :, :]}
+
+        res = {'disp_t2i': disp_t2i, 'scaled_disp_t2i': scaled_disp_t2i, 'warped_input_image': warped_input_image}
         return res
 
-    def pairwise_update(self, input_image):
+    def update(self, input_image):
         self.optimizer.zero_grad()
-        res = self.pairwise_forward(input_image)
+        res = self.forward(input_image)
         total_loss = 0.
         simi_loss = self.ncc_loss(res['warped_input_image'], input_image)
         total_loss += simi_loss
 
-        smooth_loss = loss.smooth_loss(res['scaled_disp_t2i'], res['scaled_warped_input_image'])
+        # smooth_loss = loss.smooth_loss(res['scaled_disp_t2i'], res['scaled_warped_input_image'])
+        smooth_loss = self.grad(res['scaled_disp_t2i'])
         total_loss += self.config.smooth_reg * smooth_loss
         smooth_loss_item = smooth_loss.item()
+
+        jdet_loss = loss.neg_jdet_loss(res['scaled_disp_t2i'])
+        total_loss += self.config.jdet_reg * jdet_loss
+        jdet_loss_item = jdet_loss.item()
 
         if self.config.apex:
             with amp.scale_loss(total_loss, self.optimizer) as scaled_loss:
@@ -775,41 +202,49 @@ class RegNet(nn.Module):
 
         return simi_loss.item(), smooth_loss_item, total_loss.item()
 
-    def pairwise_sample(self, input_image, path, iter):
+    def sample(self, input_image, path, iter, full_sample=False):
         with torch.no_grad():
             self.eval()
-            res = self.pairwise_forward(input_image)
+            res = self.forward(input_image)
             self.train()
-            # for index in [0, 5]:
-            arr_warped_image = res['warped_input_image'][-1, :, :, :, :].detach().squeeze(0).cpu().numpy()
-            vol_warped_image = sitk.GetImageFromArray(arr_warped_image)
-            vol_warped_image.SetSpacing([0.976, 0.976, 2.5])
-            sitk.WriteImage(vol_warped_image, os.path.join(path, f'warp_{iter}.nii'))
+            if full_sample:
+                for index in range(6):
+                    arr_warped_image = res['warped_input_image'][index, :, :, :, :].detach().squeeze(0).cpu().numpy()
+                    vol_warped_image = sitk.GetImageFromArray(arr_warped_image)
+                    vol_warped_image.SetSpacing([0.976, 0.976, 2.5])
+                    sitk.WriteImage(vol_warped_image, os.path.join(path, f'warp_{index}_{iter}.nii'))
 
-            arr_disp = res['disp_t2i'][-1, :, :, :, :].detach().squeeze(0).permute(1, 2, 3, 0).cpu().numpy()
-            vol_disp = sitk.GetImageFromArray(arr_disp)
-            vol_disp.SetSpacing([0.976, 0.976, 2.5])
-            sitk.WriteImage(vol_disp, os.path.join(path, f'disp_{iter}.nii'))
+                    arr_disp = res['disp_t2i'][index, :, :, :, :].detach().squeeze(0).permute(1, 2, 3, 0).cpu().numpy()
+                    vol_disp = sitk.GetImageFromArray(arr_disp)
+                    vol_disp.SetSpacing([0.976, 0.976, 2.5])
+                    sitk.WriteImage(vol_disp, os.path.join(path, f'disp_{index}_{iter}.nii'))
 
-            arr_moving_image = res['moving_image'].detach().squeeze(0).cpu().numpy()
+                    arr_fixed_image = input_image[index, :, :, :, :].detach().squeeze(0).cpu().numpy()
+                    vol_fixed_image = sitk.GetImageFromArray(arr_fixed_image)
+                    vol_fixed_image.SetSpacing([0.976, 0.976, 2.5])
+                    sitk.WriteImage(vol_fixed_image, os.path.join(path, f'fixed_{index}_{iter}.nii'))
+            else:
+                index = -1
+                arr_warped_image = res['warped_input_image'][index, :, :, :, :].detach().squeeze(0).cpu().numpy()
+                vol_warped_image = sitk.GetImageFromArray(arr_warped_image)
+                vol_warped_image.SetSpacing([0.976, 0.976, 2.5])
+                sitk.WriteImage(vol_warped_image, os.path.join(path, f'warp_{iter}.nii'))
+
+                arr_disp = res['scaled_disp_t2i'][index, :, :, :, :].detach().squeeze(0).permute(1, 2, 3,
+                                                                                                 0).cpu().numpy()
+                vol_disp = sitk.GetImageFromArray(arr_disp)
+                vol_disp.SetSpacing([0.976, 0.976, 2.5])
+                sitk.WriteImage(vol_disp, os.path.join(path, f'disp_{iter}.nii'))
+
+                arr_fixed_image = input_image[index, :, :, :, :].detach().squeeze(0).cpu().numpy()
+                vol_fixed_image = sitk.GetImageFromArray(arr_fixed_image)
+                vol_fixed_image.SetSpacing([0.976, 0.976, 2.5])
+                sitk.WriteImage(vol_fixed_image, os.path.join(path, f'fixed_{iter}.nii'))
+
+            arr_moving_image = input_image[0, :, :, :, :].detach().squeeze(0).cpu().numpy()
             vol_moving_image = sitk.GetImageFromArray(arr_moving_image)
             vol_moving_image.SetSpacing([0.976, 0.976, 2.5])
             sitk.WriteImage(vol_moving_image, os.path.join(path, f'moving_{iter}.nii'))
-
-            arr_fixed_image = input_image[-1, :, :, :, :].detach().squeeze(0).cpu().numpy()
-            vol_fixed_image = sitk.GetImageFromArray(arr_fixed_image)
-            vol_fixed_image.SetSpacing([0.976, 0.976, 2.5])
-            sitk.WriteImage(vol_fixed_image, os.path.join(path, f'fixed_{iter}.nii'))
-
-    def pairwise_sample_slice(self, input_image, path, iter):
-        self.eval()
-        with torch.no_grad():
-            res = self.pairwise_forward(input_image)
-            for index in [0, 5]:
-                arr = res['warped_input_image'][index, :, :, :, :].detach().squeeze(0)  # 83,157,240
-                slice = arr[50, :, :]
-                vutils.save_image(slice.data, os.path.join(path, f'warp_{iter}_{index}.png'), padding=0, normalize=True)
-        self.train()
 
     def load(self):
         state_file = self.config.load
@@ -832,7 +267,7 @@ class RegNet(nn.Module):
         print('------------------------------------')
 
 
-class RegNet2(nn.Module):
+class RegNet_CR(nn.Module):
     """
     提供了两种训练模式
     1. forward：生成从template向图像序列配准的形变场
@@ -846,53 +281,59 @@ class RegNet2(nn.Module):
         self.seq_len = seq_len
         self.scale = scale
         self.config = config
-        self.unet = Ulstm_cat(input_channels=1, output_channels=3, initial_channels=16, depth=4, kernel_size=(3, 3, 3))
+
+        self.unet = CRNet()
         self.spatial_transform = SpatialTransformer(self.dim)
-        self.ncc_loss = loss.NCC(self.config.dim, self.config.ncc_window_size)
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config.learning_rate, eps=1e-3)
         self.calcdisp = util.CalcDisp(dim=self.config.dim, calc_device=config.device)
+
+        self.ncc_loss = loss.NCC(self.config.dim, self.config.ncc_window_size)
+        self.grad = loss.Grad(penalty='l2', loss_mult=2).loss_2D
+
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config.learning_rate, eps=1e-3)
         self.description()
 
-    def pairwise_forward(self, input_image):
+    def forward(self, input_image):
 
         original_image_shape = input_image.shape[2:]
-        # input_image: [6, 1, 96, 256, 256]
-        # 下采样至1/2
-        scaled_image = F.interpolate(input_image, scale_factor=self.scale, align_corners=True, mode='trilinear',
-                                     recompute_scale_factor=True)  # (1, n, h, w) or (1, n, d, h, w)
-
-        # scaled_image: [6, 1, 48, 128, 128]
-
+        scaled_image = F.interpolate(input_image, scale_factor=self.scale,
+                                     align_corners=True, mode='bilinear' if self.dim == 2 else 'trilinear',
+                                     recompute_scale_factor=False)  # (1, n, h, w) or (1, n, d, h, w)
         scaled_image_shape = scaled_image.shape[2:]
-        scaled_disp_t2i = self.unet(scaled_image.unsqueeze(0)).squeeze(0)
 
+        scaled_disp_t2i = self.unet(scaled_image)
+        # scaled_flow_t2i = self.unet(scaled_image)
+        # scaled_flow_t2i = self.resize(scaled_flow_t2i)
+        # scaled_disp_t2i = self.vecInt(scaled_flow_t2i)
+        # scaled_flow_t2i = self.fullsize(scaled_flow_t2i)
         # scaled_disp_t2i: [6, 3, 48, 128, 128]
 
-        disp_t2i = F.interpolate(scaled_disp_t2i, size=original_image_shape, mode='trilinear', align_corners=True)
+        disp_t2i = F.interpolate(scaled_disp_t2i, size=original_image_shape,
+                                 mode='bilinear' if self.dim == 2 else 'trilinear', align_corners=True)
+        # disp_t2i: [6, 3, 96, 256, 256]
 
         moving_image = input_image[0:1, :, :, :, :].repeat(self.seq_len, 1, 1, 1, 1)
 
         warped_input_image = self.spatial_transform(moving_image, disp_t2i)
         # [6, 1, 96, 256, 256] @ [6, 3, 96, 256, 256] = [6, 1, 96, 256, 256]
 
-        scaled_warped_input_image = F.interpolate(warped_input_image, size=scaled_image_shape, mode='trilinear',
-                                                  align_corners=True)
-        # scaled_warped_input_image: [6, 1, 48, 128, 128]
-
-        res = {'disp_t2i': disp_t2i, 'scaled_disp_t2i': scaled_disp_t2i, 'warped_input_image': warped_input_image,
-               'scaled_warped_input_image': scaled_warped_input_image, 'moving_image': input_image[0, :, :, :, :]}
+        res = {'disp_t2i': disp_t2i, 'scaled_disp_t2i': scaled_disp_t2i, 'warped_input_image': warped_input_image}
         return res
 
-    def pairwise_update(self, input_image):
+    def update(self, input_image):
         self.optimizer.zero_grad()
-        res = self.pairwise_forward(input_image)
+        res = self.forward(input_image)
         total_loss = 0.
         simi_loss = self.ncc_loss(res['warped_input_image'], input_image)
         total_loss += simi_loss
 
-        smooth_loss = loss.smooth_loss(res['scaled_disp_t2i'], res['scaled_warped_input_image'])
+        # smooth_loss = loss.smooth_loss(res['scaled_disp_t2i'], res['scaled_warped_input_image'])
+        smooth_loss = self.grad(res['scaled_disp_t2i'])
         total_loss += self.config.smooth_reg * smooth_loss
         smooth_loss_item = smooth_loss.item()
+
+        jdet_loss = loss.neg_jdet_loss(res['scaled_disp_t2i'])
+        total_loss += self.config.jdet_reg * jdet_loss
+        jdet_loss_item = jdet_loss.item()
 
         if self.config.apex:
             with amp.scale_loss(total_loss, self.optimizer) as scaled_loss:
@@ -903,41 +344,48 @@ class RegNet2(nn.Module):
 
         return simi_loss.item(), smooth_loss_item, total_loss.item()
 
-    def pairwise_sample(self, input_image, path, iter):
+    def sample(self, input_image, path, iter, full_sample=False):
         with torch.no_grad():
             self.eval()
-            res = self.pairwise_forward(input_image)
+            res = self.forward(input_image)
             self.train()
-            # for index in [0, 5]:
-            arr_warped_image = res['warped_input_image'][-1, :, :, :, :].detach().squeeze(0).cpu().numpy()
-            vol_warped_image = sitk.GetImageFromArray(arr_warped_image)
-            vol_warped_image.SetSpacing([0.976, 0.976, 2.5])
-            sitk.WriteImage(vol_warped_image, os.path.join(path, f'warp_{iter}.nii'))
+            if full_sample:
+                for index in range(6):
+                    arr_warped_image = res['warped_input_image'][index, :, :, :, :].detach().squeeze(0).cpu().numpy()
+                    vol_warped_image = sitk.GetImageFromArray(arr_warped_image)
+                    vol_warped_image.SetSpacing([0.976, 0.976, 2.5])
+                    sitk.WriteImage(vol_warped_image, os.path.join(path, f'warp_{index}_{iter}.nii'))
 
-            arr_disp = res['disp_t2i'][-1, :, :, :, :].detach().squeeze(0).permute(1, 2, 3, 0).cpu().numpy()
-            vol_disp = sitk.GetImageFromArray(arr_disp)
-            vol_disp.SetSpacing([0.976, 0.976, 2.5])
-            sitk.WriteImage(vol_disp, os.path.join(path, f'disp_{iter}.nii'))
+                    arr_disp = res['disp_t2i'][index, :, :, :, :].detach().squeeze(0).permute(1, 2, 3, 0).cpu().numpy()
+                    vol_disp = sitk.GetImageFromArray(arr_disp)
+                    vol_disp.SetSpacing([0.976, 0.976, 2.5])
+                    sitk.WriteImage(vol_disp, os.path.join(path, f'disp_{index}_{iter}.nii'))
 
-            arr_moving_image = res['moving_image'].detach().squeeze(0).cpu().numpy()
+                    arr_fixed_image = input_image[index, :, :, :, :].detach().squeeze(0).cpu().numpy()
+                    vol_fixed_image = sitk.GetImageFromArray(arr_fixed_image)
+                    vol_fixed_image.SetSpacing([0.976, 0.976, 2.5])
+                    sitk.WriteImage(vol_fixed_image, os.path.join(path, f'fixed_{index}_{iter}.nii'))
+            else:
+                index = -1
+                arr_warped_image = res['warped_input_image'][index, :, :, :, :].detach().squeeze(0).cpu().numpy()
+                vol_warped_image = sitk.GetImageFromArray(arr_warped_image)
+                vol_warped_image.SetSpacing([0.976, 0.976, 2.5])
+                sitk.WriteImage(vol_warped_image, os.path.join(path, f'warp_{iter}.nii'))
+
+                arr_disp = res['disp_t2i'][index, :, :, :, :].detach().squeeze(0).permute(1, 2, 3, 0).cpu().numpy()
+                vol_disp = sitk.GetImageFromArray(arr_disp)
+                vol_disp.SetSpacing([0.976, 0.976, 2.5])
+                sitk.WriteImage(vol_disp, os.path.join(path, f'disp_{iter}.nii'))
+
+                arr_fixed_image = input_image[index, :, :, :, :].detach().squeeze(0).cpu().numpy()
+                vol_fixed_image = sitk.GetImageFromArray(arr_fixed_image)
+                vol_fixed_image.SetSpacing([0.976, 0.976, 2.5])
+                sitk.WriteImage(vol_fixed_image, os.path.join(path, f'fixed_{iter}.nii'))
+
+            arr_moving_image = input_image[0, :, :, :, :].detach().squeeze(0).cpu().numpy()
             vol_moving_image = sitk.GetImageFromArray(arr_moving_image)
             vol_moving_image.SetSpacing([0.976, 0.976, 2.5])
             sitk.WriteImage(vol_moving_image, os.path.join(path, f'moving_{iter}.nii'))
-
-            arr_fixed_image = input_image[-1, :, :, :, :].detach().squeeze(0).cpu().numpy()
-            vol_fixed_image = sitk.GetImageFromArray(arr_fixed_image)
-            vol_fixed_image.SetSpacing([0.976, 0.976, 2.5])
-            sitk.WriteImage(vol_fixed_image, os.path.join(path, f'fixed_{iter}.nii'))
-
-    def pairwise_sample_slice(self, input_image, path, iter):
-        self.eval()
-        with torch.no_grad():
-            res = self.pairwise_forward(input_image)
-            for index in [0, 5]:
-                arr = res['warped_input_image'][index, :, :, :, :].detach().squeeze(0)  # 83,157,240
-                slice = arr[50, :, :]
-                vutils.save_image(slice.data, os.path.join(path, f'warp_{iter}_{index}.png'), padding=0, normalize=True)
-        self.train()
 
     def load(self):
         state_file = self.config.load

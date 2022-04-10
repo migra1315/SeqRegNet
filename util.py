@@ -188,18 +188,11 @@ class CalTRE():
 
 
 def get_case(case_num):
-    if case_num == 0:
-        case = 0
-        crop_range = [slice(0, 96), slice(0, 256), slice(0, 256)]
-        pixel_spacing = np.array([0.97, 0.97, 5], dtype=np.float32)
-
-    elif case_num == 1:
+    if case_num == 1:
         case = 1
-        # crop_range = [slice(0, 96), slice(0, 256), slice(0, 256)]
-        # pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
-
-        crop_range = [slice(0, 83), slice(43, 200), slice(10, 250)]
+        crop_range = [slice(0, 96), slice(0, 256), slice(0, 256)]
         pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
+
     elif case_num == 2:
         case = 2
         crop_range = [slice(1, 97), slice(0, 256), slice(0, 256)]
@@ -330,10 +323,14 @@ def load_data_test(data_folder, crop_range):
     return input_image, image_shape, num_image
 
 
-def init_model(model_case):
-    model_name = model_case
-    Model = model.RegNet
-    return model_name, Model
+def init_model(model_name):
+    if model_name == 'cat':
+        Model = model.RegNet
+    elif model_name == 'cr':
+        Model = model.RegNet_CR
+    else:
+        raise ValueError("model name should be cat or cr")
+    return Model
 
 
 def write_loss(writer, simi_loss, smooth_loss, total_loss, mean, std, i):
