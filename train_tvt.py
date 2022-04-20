@@ -3,9 +3,6 @@ import logging
 import os
 import random
 import sys
-import torch.multiprocessing as mp
-
-# python -m torch.distributed.launch --nnodes=1 --nproc_per_node=3 --node_rank=0  --master_port=6005 train_tvt.py --apex
 
 # os.environ['CUDA_VISIBLE_DEVICES'] ="3"
 import numpy as np
@@ -17,7 +14,8 @@ from torch.utils.data import DataLoader
 
 import model
 import util
-from util import CalTRE, write_loss, get_case, SeqDataSet
+
+# python -m torch.distributed.launch --nnodes=1 --nproc_per_node=3 --node_rank=0  --master_port=6005 train_tvt.py --apex
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
@@ -103,9 +101,9 @@ def train_dist(args):
 
                     # 每隔指定轮数，测试TRE
                     if args.group:
-                        mean, std, diff = regnet.calcdisp.cal_tre(res, config, grid_tuple, landmark_00_converted,
-                                                                  landmark_disp,
-                                                                  pixel_spacing)
+                        mean, std, diff = regnet.calculate_disp.cal_tre(res, config, grid_tuple, landmark_00_converted,
+                                                                        landmark_disp,
+                                                                        pixel_spacing)
                     else:
                         flow = res['disp_t2i'][config.fixed_disp_indexes]
                         calTRE = CalTRE(grid_tuple, flow)
@@ -200,9 +198,9 @@ def train(args):
 
                     # 每隔指定轮数，测试TRE
                     if args.group:
-                        mean, std, diff = regnet.calcdisp.cal_tre(res, config, grid_tuple, landmark_00_converted,
-                                                                  landmark_disp,
-                                                                  pixel_spacing)
+                        mean, std, diff = regnet.calculate_disp.cal_tre(res, config, grid_tuple, landmark_00_converted,
+                                                                        landmark_disp,
+                                                                        pixel_spacing)
                     else:
                         flow = res['disp_t2i'][config.fixed_disp_indexes]
                         calTRE = CalTRE(grid_tuple, flow)
@@ -271,9 +269,9 @@ def test(args):
 
             # 每隔指定轮数，测试TRE
             if args.group:
-                mean, std, diff = regnet.calcdisp.cal_tre(res, config, grid_tuple, landmark_00_converted,
-                                                          landmark_disp,
-                                                          pixel_spacing)
+                mean, std, diff = regnet.calculate_disp.cal_tre(res, config, grid_tuple, landmark_00_converted,
+                                                                landmark_disp,
+                                                                pixel_spacing)
             else:
                 flow = res['disp_t2i'][config.fixed_disp_indexes]
                 calTRE = CalTRE(grid_tuple, flow)

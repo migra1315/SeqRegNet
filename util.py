@@ -1,11 +1,13 @@
 import os
 import os.path
+import random
 import time
 
 import SimpleITK as sitk
 import numpy as np
 import torch
 import torch.utils.data as data
+import yaml
 from scipy import interpolate
 
 import model
@@ -14,6 +16,55 @@ import model
 class Struct:
     def __init__(self, **entries):
         self.__dict__.update(entries)
+
+
+def init_model(model_name):
+    if model_name == 'ucr':
+        Model = model.RegNet
+        print('init model RegNet Ucr ...')
+    elif model_name == 'fucr':
+        Model = model.RegNet_full
+        print('init model RegNet Fucr ...')
+
+    elif model_name == 'cr':
+        Model = model.RegNet_CR
+        print('init model RegNet Cr ...')
+
+    else:
+        raise ValueError("model name should be cat or cr")
+    return Model
+
+
+def make_ready(args, config):
+    case = args.case_num
+    if args.remote:
+        data_folder = f'/data/JY/Dirlab/case{case}/'
+        landmark_file = f'/data/JY/Dirlab/case{case}/Case{case}_300_00_50.pt'
+    else:
+        data_folder = f'../DataBase/Dirlab/case{case}/'
+        landmark_file = f'../DataBase/Dirlab/case{case}/Case{case}_300_00_50.pt'
+    crop_range, pixel_spacing = get_case(case)
+    input_image, image_shape, num_image = load_data(data_folder, crop_range)
+    if config['group_index_list'] is not None:
+        input_image = input_image[config['group_index_list']]
+
+    # 导入标记点，后续计算TRE
+    landmark_info = torch.load(landmark_file)
+    landmark_00 = landmark_info['landmark_00']
+    landmark_50 = landmark_info['landmark_50']
+
+    grid_tuple = [np.arange(grid_length, dtype=np.float32) for grid_length in image_shape]
+    landmark_00_converted = np.flip(landmark_00, axis=1) - np.array(
+        [crop_range[0].start, crop_range[1].start, crop_range[2].start], dtype=np.float32)
+    landmark_50_converted = np.flip(landmark_50, axis=1) - np.array(
+        [crop_range[0].start, crop_range[1].start, crop_range[2].start], dtype=np.float32)
+
+    return case, input_image, pixel_spacing, grid_tuple, landmark_00_converted, landmark_50_converted
+
+
+def get_config(config):
+    with open(config, 'r') as stream:
+        return yaml.load(stream, Loader=yaml.FullLoader)
 
 
 class StopCriterion(object):
@@ -41,91 +92,7 @@ class StopCriterion(object):
             return False
 
 
-class CalcDisp(object):
-    '''
-    GroupRegWise计算TRE
-    '''
-
-    def __init__(self, dim, calc_device):
-        self.device = calc_device
-        self.dim = dim
-        self.spatial_transformer = model.SpatialTransformer(dim=dim)
-
-    def inverse_disp(self, disp, threshold=0.01, max_iteration=20):
-        '''
-        compute the inverse field. implementation of "A simple fixed‐point approach to invert a deformation field"
-
-        disp : (n, 2, h, w) or (n, 3, d, h, w) or (2, h, w) or (3, d, h, w)
-            displacement field
-        '''
-        forward_disp = disp.detach().to(device=self.device)
-        if disp.ndim < self.dim + 2:
-            forward_disp = torch.unsqueeze(forward_disp, 0)
-        backward_disp = torch.zeros_like(forward_disp)
-        backward_disp_old = backward_disp.clone()
-        for i in range(max_iteration):
-            backward_disp = -self.spatial_transformer(forward_disp, backward_disp)
-            diff = torch.max(torch.abs(backward_disp - backward_disp_old)).item()
-            if diff < threshold:
-                break
-            backward_disp_old = backward_disp.clone()
-        if disp.ndim < self.dim + 2:
-            backward_disp = torch.squeeze(backward_disp, 0)
-
-        return backward_disp
-
-    def compose_disp(self, disp_i2t, disp_t2i, mode='corr'):
-        '''
-        compute the composition field
-
-        disp_i2t: (n, 3, d, h, w)
-            displacement field from the input image to the template
-
-        disp_t2i: (n, 3, d, h, w)
-            displacement field from the template to the input image
-
-        mode: string, default 'corr'
-            'corr' means generate composition of corresponding displacement field in the batch dimension only, the result shape is the same as input (n, 3, d, h, w)
-            'all' means generate all pairs of composition displacement field. The result shape is (n, n, 3, d, h, w)
-        '''
-        disp_i2t_t = disp_i2t.detach().to(device=self.device)
-        disp_t2i_t = disp_t2i.detach().to(device=self.device)
-        if disp_i2t.ndim < self.dim + 2:
-            disp_i2t_t = torch.unsqueeze(disp_i2t_t, 0)
-        if disp_t2i.ndim < self.dim + 2:
-            disp_t2i_t = torch.unsqueeze(disp_t2i_t, 0)
-
-        if mode == 'corr':
-            composed_disp = self.spatial_transformer(disp_t2i_t,
-                                                     disp_i2t_t) + disp_i2t_t  # (n, 2, h, w) or (n, 3, d, h, w)
-        elif mode == 'all':
-            assert len(disp_i2t_t) == len(disp_t2i_t)
-            n, _, *image_shape = disp_i2t.shape
-            disp_i2t_nxn = torch.repeat_interleave(torch.unsqueeze(disp_i2t_t, 1), n,
-                                                   1)  # (n, n, 2, h, w) or (n, n, 3, d, h, w)
-            disp_i2t_nn = disp_i2t_nxn.reshape(n * n, self.dim,
-                                               *image_shape)  # (n*n, 2, h, w) or (n*n, 3, d, h, w), the order in the first dimension is [0_T, 0_T, ..., 0_T, 1_T, 1_T, ..., 1_T, ..., n_T, n_T, ..., n_T]
-            disp_t2i_nn = torch.repeat_interleave(torch.unsqueeze(disp_t2i_t, 0), n, 0).reshape(n * n, self.dim,
-                                                                                                *image_shape)  # (n*n, 2, h, w) or (n*n, 3, d, h, w), the order in the first dimension is [0_T, 1_T, ..., n_T, 0_T, 1_T, ..., n_T, ..., 0_T, 1_T, ..., n_T]
-            composed_disp = self.spatial_transformer(disp_t2i_nn, disp_i2t_nn).reshape(n, n, self.dim,
-                                                                                       *image_shape) + disp_i2t_nxn  # (n, n, 2, h, w) or (n, n, 3, d, h, w) + disp_i2t_nxn
-        else:
-            raise
-        if disp_i2t.ndim < self.dim + 2 and disp_t2i.ndim < self.dim + 2:
-            composed_disp = torch.squeeze(composed_disp)
-        return composed_disp
-
-    def cal_tre(self, res, config, grid_tuple, landmark_00_converted, landmark_disp, pixel_spacing):
-        disp_i2t = self.inverse_disp(res['disp_t2i'][config.pair_disp_indexes])
-        composed_disp = self.compose_disp(disp_i2t, res['disp_t2i'][config.pair_disp_indexes], mode='all')
-        composed_disp_np = composed_disp.cpu().numpy()  # (2, 2, 3, d, h, w)
-        inter = interpolate.RegularGridInterpolator(grid_tuple, np.moveaxis(composed_disp_np[0, 1], 0, -1))
-        calc_landmark_disp = inter(landmark_00_converted)
-        diff = (np.sum(((calc_landmark_disp - landmark_disp) * pixel_spacing) ** 2, 1)) ** 0.5
-        return np.mean(diff), np.std(diff), diff
-
-
-class CalTRE():
+class CalTRE:
     '''
     pairwise方法
     根据形变场计算配准后的TRE
@@ -172,8 +139,8 @@ class CalTRE():
 
     def cal_disp(self, landmark_moving, landmark_fixed, spacing):
         diff_list = []
-        gt = np.flip((landmark_fixed[1] - landmark_moving[1]), 0)  # 对应的方向分别为[240,157,83]
-        pred = self.inter(landmark_moving[1])
+        # gt = np.flip((landmark_fixed[1] - landmark_moving[1]), 0)  # 对应的方向分别为[240,157,83]
+        # pred = self.inter(landmark_moving[1])
 
         for i in range(300):
             # landmark_moving[i]处的推理形变场pred
@@ -183,109 +150,50 @@ class CalTRE():
             diff_list.append(pred - gt)
         diff_voxel = np.array(diff_list).squeeze(1)
         # 计算300个点对的欧氏距离
-        diff = (np.sum(((diff_voxel) * spacing) ** 2, 1)) ** 0.5
+        diff = (np.sum((diff_voxel * spacing) ** 2, 1)) ** 0.5
         return np.mean(diff), np.std(diff), diff
 
 
-def get_case(case_num):
-    if case_num == 1:
-        case = 1
-        crop_range = [slice(0, 96), slice(0, 256), slice(0, 256)]
-        pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
+def set_random_seed(seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
-    elif case_num == 2:
-        case = 2
-        crop_range = [slice(1, 97), slice(0, 256), slice(0, 256)]
+
+def get_case(case):
+    if case == 1:
+        crop_range = [slice(0, 83), slice(43, 200), slice(10, 250)]
+        pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
+    elif case == 2:
+        crop_range = [slice(5, 98), slice(30, 195), slice(8, 243)]
         pixel_spacing = np.array([1.16, 1.16, 2.5], dtype=np.float32)
-    elif case_num == 3:
-        case = 3
-        crop_range = [slice(2, 98), slice(0, 256), slice(0, 256)]
-        pixel_spacing = np.array([1.15, 1.15, 2.5], dtype=np.float32)
-    elif case_num == 4:
-        case = 4
-        crop_range = [slice(0, 96), slice(0, 256), slice(0, 256)]
-        pixel_spacing = np.array([1.13, 1.13, 2.5], dtype=np.float32)
-    elif case_num == 5:
-        case = 5
-        crop_range = [slice(0, 96), slice(0, 256), slice(0, 256)]
-        pixel_spacing = np.array([1.10, 1.10, 2.5], dtype=np.float32)
-    elif case_num == 6:
-        case = 6
-        crop_range = [slice(13, 109), slice(118, 374), slice(152, 408)]
-        pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
-    elif case_num == 7:
-        case = 7
-        crop_range = [slice(14, 110), slice(108, 364), slice(142, 398)]
-        pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
-    elif case_num == 8:
-        case = 8
-        crop_range = [slice(18, 114), slice(68, 324), slice(125, 381)]
-        pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
-    elif case_num == 9:
-        case = 9
-        crop_range = [slice(0, 96), slice(105, 361), slice(133, 389)]
-        pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
-    else:
-        case = 10
-        crop_range = [slice(0, 96), slice(98, 354), slice(131, 387)]
-        pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
-    return case, crop_range, pixel_spacing
-
-
-def get_case_demo(case_num):
-    if case_num == 0:
-        case = 0
-        crop_range = [slice(0, 66), slice(170, 430), slice(50, 450)]
-        pixel_spacing = np.array([0.97, 0.97, 5], dtype=np.float32)
-    elif case_num == 1:
-        case = 1
-        crop_range = [slice(0, 94), slice(42, 202), slice(0, 256)]
-        pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
-        # crop_range = [slice(0, 83), slice(43, 200), slice(10, 250)]
-        # pixel_spacing = np.array([0.97, 0.97, 2.5], dtype = np.float32)
-    elif case_num == 2:
-        case = 2
-        crop_range = [slice(2, 98), slice(22, 198), slice(8, 248)]
-        pixel_spacing = np.array([1.16, 1.16, 2.5], dtype=np.float32)
-        # crop_range = [slice(5, 98), slice(30, 195), slice(8, 243)]
-        # pixel_spacing = np.array([1.16, 1.16, 2.5], dtype = np.float32)
-    elif case_num == 3:
-        case = 3
+    elif case == 3:
         crop_range = [slice(0, 95), slice(42, 209), slice(10, 248)]
         pixel_spacing = np.array([1.15, 1.15, 2.5], dtype=np.float32)
-    elif case_num == 4:
-        case = 4
+    elif case == 4:
         crop_range = [slice(0, 90), slice(45, 209), slice(11, 242)]
         pixel_spacing = np.array([1.13, 1.13, 2.5], dtype=np.float32)
-    elif case_num == 5:
-        case = 5
-        # crop_range = [slice(0, 96), slice(60, 220), slice(0, 256)]
-        # pixel_spacing = np.array([1.10, 1.10, 2.5], dtype = np.float32)
-        crop_range = [slice(0, 96), slice(0, 256), slice(0, 256)]
+    elif case == 5:
+        crop_range = [slice(0, 90), slice(60, 222), slice(16, 237)]
         pixel_spacing = np.array([1.10, 1.10, 2.5], dtype=np.float32)
-        # crop_range = [slice(0, 90), slice(60, 222), slice(16, 237)]
-        # pixel_spacing = np.array([1.10, 1.10, 2.5], dtype = np.float32)
-    elif case_num == 6:
-        case = 6
+    elif case == 6:
         crop_range = [slice(10, 107), slice(144, 328), slice(132, 426)]
         pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
-    elif case_num == 7:
-        case = 7
+    elif case == 7:
         crop_range = [slice(13, 108), slice(141, 331), slice(114, 423)]
         pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
-    elif case_num == 8:
-        case = 8
-        crop_range = [slice(18, 118), slice(84, 299), slice(113, 390)]
+    elif case == 8:
+        crop_range = [slice(17, 113), slice(91, 299), slice(123, 380)]
         pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
-    elif case_num == 9:
-        case = 9
+    elif case == 9:
         crop_range = [slice(0, 70), slice(126, 334), slice(128, 390)]
         pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
-    else:
-        case = 10
+    elif case == 10:
         crop_range = [slice(0, 90), slice(119, 333), slice(140, 382)]
         pixel_spacing = np.array([0.97, 0.97, 2.5], dtype=np.float32)
-    return case, crop_range, pixel_spacing
+    else:
+        raise ValueError('case num should be 0 to 10')
+    return crop_range, pixel_spacing
 
 
 def load_data(data_folder, crop_range):
@@ -296,13 +204,9 @@ def load_data(data_folder, crop_range):
     image_list = [sitk.GetArrayFromImage(sitk.ReadImage(os.path.join(data_folder, file_name))) for file_name in
                   image_file_list]
     input_image = torch.stack([torch.from_numpy(image)[None] for image in image_list], 0)
-
-    input_image = (input_image - input_image.min()) / (input_image.max() - input_image.min())
-
     input_image = input_image[:, :, crop_range[0], crop_range[1], crop_range[2]]
+    input_image = (input_image - input_image.min()) / (input_image.max() - input_image.min())
     num_image = input_image.shape[0]  # number of image in the group
-    # if input_image.size()[2] < 96:
-    #     input_image = torch.cat((input_image, torch.zeros([num_image, 1, 2, 256, 256])), dim=2)
     image_shape = input_image.size()[2:]
     return input_image, image_shape, num_image
 
@@ -314,29 +218,22 @@ def load_data_test(data_folder, crop_range):
     image_list = [sitk.GetArrayFromImage(sitk.ReadImage(os.path.join(data_folder, file_name))) for file_name in
                   image_file_list]
     input_image = torch.stack([torch.from_numpy(image)[None] for image in image_list], 0)
-
-    input_image = (input_image - input_image.min()) / (input_image.max() - input_image.min())
-
     # input_image = input_image[:, :, crop_range[0], crop_range[1], crop_range[2]]
+    input_image = (input_image - input_image.min()) / (input_image.max() - input_image.min())
     image_shape = input_image.size()[2:]  # (d, h, w)
     num_image = input_image.shape[0]  # number of image in the group
     return input_image, image_shape, num_image
 
 
-def init_model(model_name):
-    if model_name == 'cat':
-        Model = model.RegNet
-    elif model_name == 'cr':
-        Model = model.RegNet_CR
-    else:
-        raise ValueError("model name should be cat or cr")
-    return Model
-
-
-def write_loss(writer, simi_loss, smooth_loss, total_loss, mean, std, i):
+def write_update_loss(writer, simi_loss, smooth_loss, jdet_loss, cyclic_loss, total_loss, i):
     writer.add_scalar('simi', simi_loss, i)
     writer.add_scalar('smooth', smooth_loss, i)
+    writer.add_scalar('jdet', jdet_loss, i)
+    writer.add_scalar('cyclic', cyclic_loss, i)
     writer.add_scalar('total', total_loss, i)
+
+
+def write_validation_loss(writer, mean, std, i):
     writer.add_scalar('tre_m', mean, i)
     writer.add_scalar('tre_s', std, i)
 
@@ -370,10 +267,10 @@ def load_data_for_dataset(path):
 
 
 def get_img_path_list(data_folder):
-    list = []
+    list_ = []
     for file_name in os.listdir(data_folder):
-        list.append(os.path.join(data_folder, file_name))
-    return list
+        list_.append(os.path.join(data_folder, file_name))
+    return list_
 
 
 class SeqDataSet(data.Dataset):

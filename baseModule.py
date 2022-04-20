@@ -256,108 +256,101 @@ class DownConvLSTMBlock(nn.Module):
     def __init__(self, input_channels, hidden_channels, kernel_size):
         super().__init__()
         self.block1 = ConvLSTM(input_channels, hidden_channels, kernel_size)
-        # self.block2 = ConvLSTM(hidden_channels, hidden_channels, kernel_size)
 
-    def forward(self, x):
-        x = self.block1(x)
-        # x = self.block2(x)
-        x = F.interpolate(x.squeeze(0), scale_factor=0.5, mode='trilinear', align_corners=True,
+    def forward(self, x, skip_list=None):
+        x = self.block1(x).squeeze(0)
+        if skip_list:
+            skip_list.append(x)
+        x = F.interpolate(x, scale_factor=0.5, mode='trilinear', align_corners=True,
                           recompute_scale_factor=True)
         return x.unsqueeze(0)
 
 
-class UpConvLSTMBlock(nn.Module):
-    def __init__(self, input_channels, hidden_channels, kernel_size):
-        super().__init__()
-        self.block1 = ConvLSTM(input_channels * 2, input_channels, kernel_size)
-        # self.atten =ConvFormer(in_channels=hidden_channels, out_channels=hidden_channels, position_embedding_size=None)
-        self.block2 = ConvLSTM(input_channels, hidden_channels, kernel_size)
+class UCR(nn.Module):
+    """
+    按照PPT中画的网络结构来做的
+    """
 
-    def forward(self, x, skip):
-        skip = F.interpolate(skip.squeeze(0), size=x.size()[3:], mode='trilinear', align_corners=True).unsqueeze(0)
-        x = torch.cat([x, skip], dim=2)
-        x = self.block1(x)
-        x = self.block2(x)
-        # x = self.atten(x,skip)
-        x = F.interpolate(x.squeeze(0), scale_factor=2, mode='trilinear', align_corners=True,
-                          recompute_scale_factor=True)
-        return x.unsqueeze(0)
+    def __init__(self):
+        super(UCR, self).__init__()
+        self.down_conv = ConvBlock(in_channels=1, out_channels=16,
+                                   kernel_size=(3, 3, 3), padding=1, bias=True)
+        self.down_1 = DownConvLSTMBlock(input_channels=16, hidden_channels=32, kernel_size=(3, 3, 3))
+        self.down_2 = DownConvLSTMBlock(input_channels=32, hidden_channels=64, kernel_size=(3, 3, 3))
 
+        self.bottle_neck_1 = ConvLSTM(input_dim=64, hidden_dim=128, kernel_size=(3, 3, 3))
+        self.bottle_neck_2 = ConvLSTM(input_dim=128, hidden_dim=64, kernel_size=(3, 3, 3))
 
-class Ulstm_cat(nn.Module):
-    def __init__(self, input_channels=1, output_channels=3, initial_channels=16, depth=3, kernel_size=(3, 3, 3)):
-        super(Ulstm_cat, self).__init__()
-        self.depth = depth
-        prev_channels = input_channels
-        self.first = ConvBlock(in_channels=prev_channels, out_channels=initial_channels,
-                               kernel_size=(3, 3, 3), padding=(1, 1, 1), bias=True)
+        self.up_20 = ConvLSTM(input_dim=128, hidden_dim=64, kernel_size=(3, 3, 3))
+        self.up_21 = ConvLSTM(input_dim=64, hidden_dim=32, kernel_size=(3, 3, 3))
 
-        prev_channels = initial_channels
-        self.down_path = nn.ModuleList()
-        for i in range(self.depth):
-            current_channels = 2 ** (i + 1) * initial_channels
-            print("down: ", prev_channels, current_channels)
-            self.down_path.append(DownConvLSTMBlock(input_channels=prev_channels, hidden_channels=current_channels,
-                                                    kernel_size=kernel_size))
-            prev_channels = current_channels
+        self.up_10 = ConvLSTM(input_dim=64, hidden_dim=32, kernel_size=(3, 3, 3))
+        self.up_11 = ConvLSTM(input_dim=32, hidden_dim=16, kernel_size=(3, 3, 3))
 
-        current_channels = prev_channels // 2
-        print("bottle_neck: ", prev_channels, current_channels)
-
-        self.bottle_neck = nn.ModuleList()
-        self.bottle_neck.append(ConvLSTM(input_dim=prev_channels, hidden_dim=current_channels, kernel_size=(3, 3, 3)))
-        self.bottle_neck.append(
-            ConvLSTM(input_dim=current_channels, hidden_dim=current_channels, kernel_size=(3, 3, 3)))
-        prev_channels = current_channels
-
-        self.up_path = nn.ModuleList()
-        for i in reversed(range(self.depth - 1)):
-            current_channels = prev_channels // 2
-            print("up: ", prev_channels, current_channels)
-
-            self.up_path.append(UpConvLSTMBlock(input_channels=prev_channels, hidden_channels=current_channels,
-                                                kernel_size=kernel_size))
-            prev_channels = current_channels
-
-        # self.last = ConvLSTM(prev_channels, 3, kernel_size)
-        self.last = nn.Conv3d(in_channels=16, out_channels=3, kernel_size=(3, 3, 3), padding=(1, 1, 1))
+        self.up_conv1 = nn.Conv3d(in_channels=32, out_channels=16, kernel_size=(3, 3, 3), padding=(1, 1, 1))
+        self.up_conv2 = nn.Conv3d(in_channels=16, out_channels=3, kernel_size=(1, 1, 1), padding=(0, 0, 0))
 
     def forward(self, x):
+        # 需求input [6, 1, 48, 128, 128]
+        seq_len = x.size()[0]
+        image_shape = x.size()[2:]
 
         embedding_list = []
-        x = x.squeeze(0)
-        for t in range(x.size()[0]):
-            embedding = self.first(x[t:t + 1, :])
+        for index in range(seq_len):
+            embedding = self.down_conv(x[index:index + 1, :])
             embedding_list.append(embedding)
-        x = torch.stack(embedding_list, dim=1)
-        # print(x.size())
+        x = torch.stack(embedding_list, dim=1).squeeze(0)
+        # print('embedding out:',x.size())
+        down_list = [x]
+        x = F.interpolate(x, scale_factor=0.5, mode='trilinear', align_corners=True,
+                          recompute_scale_factor=True).unsqueeze(0)
 
-        blocks = []
-        in_size = x.size()[3:]
-        for i, down in enumerate(self.down_path):
-            x = down(x)
-            # print(x.size())
-            if i < self.depth - 1:
-                blocks.append(x)
-        for bottle_block in self.bottle_neck:
-            x = bottle_block(x)
+        x = self.down_1(x, down_list)
+        # print('down1 out:',x.size())
+        x = self.down_2(x, down_list)
+        # print('down2 out:',x.size())
 
-        for i, up in enumerate(self.up_path):
-            # print(x.size(),blocks[-i - 1].size())
-            x = up(x, blocks[-i - 1])
+        x = self.bottle_neck_1(x)
+        # print('bottle_neck_1:',x.size())
+        x = self.bottle_neck_2(x)
+        # print('bottle_neck_2:',x.size())
 
+        x = F.interpolate(x.squeeze(0), size=down_list[2].size()[2:], mode='trilinear', align_corners=True,
+                          recompute_scale_factor=False)
+        # print('bottle_neck_2_sample:',x.size(),down_list[2].size())
+        x = torch.cat((x, down_list[2]), dim=1).unsqueeze(0)
+        x = self.up_20(x)
+        x = self.up_21(x)
+
+        # print('up2 out:',x.size(),down_list[1].size())
+        x = F.interpolate(x.squeeze(0), size=down_list[1].size()[2:], mode='trilinear', align_corners=True,
+                          recompute_scale_factor=False)
+        x = torch.cat((x, down_list[1]), dim=1)
+        x = self.up_10(x.unsqueeze(0))
+        x = self.up_11(x)
+
+        # print('up1 out:',x.size(),down_list[0].size())
+        x = F.interpolate(x.squeeze(0), size=down_list[0].size()[2:], mode='trilinear', align_corners=True,
+                          recompute_scale_factor=False)
+        x = torch.cat((x, down_list[0]), dim=1)
         disp_list = []
-        x = x.squeeze(0)
-        for t in range(x.size()[0]):
-            disp = self.last(x[t:t + 1, :])
+        for index in range(seq_len):
+            disp = self.up_conv1(x[index:index + 1, :])
+            disp = self.up_conv2(disp)
             disp_list.append(disp)
         x = torch.stack(disp_list, dim=1).squeeze(0)
 
-        x = F.interpolate(x, size=in_size, mode='trilinear', align_corners=True).unsqueeze(0)
+        x = F.interpolate(x, size=image_shape, mode='trilinear', align_corners=True,
+                          recompute_scale_factor=False)
+
         return x
 
 
 class UlstmCatSkipConnect(nn.Module):
+    """
+    现有实验结果的来源
+    """
+
     def __init__(self):
         super(UlstmCatSkipConnect, self).__init__()
         self.down_conv = ConvBlock(in_channels=1, out_channels=16,
@@ -565,6 +558,10 @@ class Ulstm_Conv_Former(nn.Module):
 
 
 class CRNet(nn.Module):
+    """
+    根据Lung CRNet复现的
+    """
+
     def __init__(self):
         super(CRNet, self).__init__()
         self.down_conv_1 = ConvBlock(in_channels=1, out_channels=8,

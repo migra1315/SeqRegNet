@@ -105,9 +105,7 @@ class Grad:
         return grad
 
     def loss_3D(self, _, y_pred):
-        '''
-        有误未修正，后边用到参照2D方法修改
-        '''
+
         dy = torch.abs(y_pred[:, :, 1:, :, :] - y_pred[:, :, :-1, :, :])
         dx = torch.abs(y_pred[:, :, :, 1:, :] - y_pred[:, :, :, :-1, :])
         dz = torch.abs(y_pred[:, :, :, :, 1:] - y_pred[:, :, :, :, :-1])
@@ -171,11 +169,10 @@ def mse_loss(y_true, y_pred):
 
 def jacboian_det(displacement):
     """
-    input:
+    :param displacement
         displacement:[batch,channels,L,W,D],如[1,3,256,256,96]
         之后permute成1,256,256,96,3
-    methods:
-        参见2D
+
     """
     displacement = displacement.permute(0, 2, 3, 4, 1)
 
@@ -193,6 +190,17 @@ def jacboian_det(displacement):
 
 
 def neg_jdet_loss(displacement):
-    neg_jdet = -1.0 * jacboian_det(displacement)
-    selected_neg_jdet = F.relu(neg_jdet)
+    selected_neg_jdet = F.relu(-1.0 * jacboian_det(displacement))
     return torch.mean(selected_neg_jdet)
+
+
+def calculate_jac(flow):
+    # flow = res['disp_t2i'].detach()
+    jac = jacboian_det(flow)
+    exist = (jac < 0) * 1.0
+    image_shape = 1
+    for size_ in jac.size():
+        image_shape = image_shape * size_
+    jac_percent = torch.sum(exist) / image_shape * 100
+    jac_mean = torch.mean(jac)
+    return jac_percent, jac_mean
