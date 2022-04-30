@@ -7,17 +7,19 @@ device: 'cuda'
 stop_std: 0.0007
 stop_query_len: 100
 max_num_iteration: 3000
+save_file: '0ton'
 
 # model structure parameters
 scale: 0.5
 dim: 3
+forward_type: 'zero to N'
 
 # optimized parameters
 learning_rate: 0.001
 normalization: true
-smooth_reg: 0.01
+smooth_reg: 0.001
 cyc_reg: 0
-jdet_reg: 0.01
+jdet_reg: 0
 ncc_window_size: 5
 
 # test parameters

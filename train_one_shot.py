@@ -36,20 +36,7 @@ def main(args):
     input_image = input_image.to(config['device'])
     print('input size:', input_image.size())
 
-    # config = dict(
-    #     train=not args.test, load=args.load, scale=args.scale, max_num_iteration=args.max_num_iteration,
-    #     dim=3, learning_rate=args.lr, apex=args.apex, initial_channels=args.initial_channels, depth=4,
-    #     normalization=True, smooth_reg=1e-3, jdet_reg=1e-2, cyc_reg=1e-2,
-    #     ncc_window_size=5, fixed_disp_indexes=5, group_index_list=[0, 1, 2, 3, 4, 5, 9, 8, 7, 6],
-    #     pair_disp_calc_interval=50, stop_std=0.0007, stop_query_len=100,
-    #     device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-    #     jac_type=args.jac
-    # )
-    # # group_index_list = [0, 1, 2, 3, 4, 5]
-    # config = util.Struct(**config)
-
-    states_folder = 'result'
-    # if not os.path.exists(states_folder):
+    states_folder = 'result_0430'
     os.mkdir(states_folder) if not os.path.exists(states_folder) else None
     index = len([file for file in os.listdir(states_folder) if os.path.isdir(os.path.join(states_folder, file))])
 
@@ -64,7 +51,7 @@ def main(args):
     if config['train']:
         start = time.time()
 
-        states_file = config['model'] + f'_case{case}_{index:03d}'
+        states_file = config['model'] + config['save_file'] + f'_case{case}_{index:03d}'
         train_writer = tensorboardX.SummaryWriter(os.path.join(states_folder, states_file))
         config_save_path = os.path.join(states_folder, states_file, 'config.yaml')
         shutil.copy(args.config, config_save_path)
@@ -79,8 +66,9 @@ def main(args):
             if i % 50 == 0:
                 res = regnet.forward(input_image, sample=True)
                 # 每隔指定轮数，测试TRE
-                flow = res['disp_t2i'][config['fixed_disp_indexes']]
-                calTRE = util.CalTRE(grid_tuple, flow)
+                # calTRE = util.CalTRE(grid_tuple, res['disp_t2i'][config['fixed_disp_indexes']])
+                calTRE = util.CalTRE_2(grid_tuple, res['disp_t2i'])
+
                 mean, std, diff = calTRE.cal_disp(landmark_00_converted, landmark_50_converted, pixel_spacing)
                 util.write_validation_loss(train_writer, mean, std, i)
                 print(f'\ndiff: {mean:.2f}±{std:.2f}({np.max(diff):.2f})')
@@ -106,9 +94,9 @@ def main(args):
                     torch.save(states, os.path.join(states_folder, states_file, 'best.pth'))
                     logging.info(f'save model state {states_file} of iter {i}')
 
-            stop_criterion.add(simi_loss)
-            if stop_criterion.stop():
-                break
+            # stop_criterion.add(simi_loss)
+            # if stop_criterion.stop():
+            #     break
             pbar.set_description(f'{i}, simi. loss {simi_loss:.4f},'
                                  f' smooth loss {smooth_loss:.3f},'
                                  f' jdet loss {jdet_loss:.3f}'
@@ -122,8 +110,10 @@ def main(args):
 
         res = regnet.forward(input_image, sample=True)
         # regnet.sample(input_image, os.path.join(states_folder, states_file), 'best', full_sample=True)
-        flow = res['disp_t2i'][config['fixed_disp_indexes']]
-        calTRE = util.CalTRE(grid_tuple, flow)
+
+        # calTRE = util.CalTRE(grid_tuple, res['disp_t2i'][config['fixed_disp_indexes']])
+        calTRE = util.CalTRE_2(grid_tuple, res['disp_t2i'])
+
         mean, std, diff = calTRE.cal_disp(landmark_00_converted, landmark_50_converted, pixel_spacing)
         print(f'diff: {mean:.2f}±{std:.2f}({np.max(diff):.2f})')
 
@@ -154,11 +144,15 @@ def main(args):
         with torch.no_grad():
             res = regnet.forward(input_image, sample=True)
             save_path, _ = os.path.split(config['load'])
+            regnet.sample(input_image, save_path, 'test', full_sample=True)
             print('save file into ', save_path)
-            # regnet.sample(input_image, save_path, 'test', full_sample=True)
 
-            print('disp size:', res['disp_t2i'][config['fixed_disp_indexes']].size())
-            calTRE = util.CalTRE(grid_tuple, res['disp_t2i'][config['fixed_disp_indexes']])
+            # print('disp size:', res['disp_t2i'][config['fixed_disp_indexes']].size())
+            # calTRE = util.CalTRE(grid_tuple, res['disp_t2i'][config['fixed_disp_indexes']])
+
+            print('disp size:', res['disp_t2i'].size())
+            calTRE = util.CalTRE_2(grid_tuple, res['disp_t2i'])
+
             mean, std, diff = calTRE.cal_disp(landmark_00_converted, landmark_50_converted, pixel_spacing)
 
             flow = res['disp_t2i'].detach().cpu()  # .numpy()
@@ -179,12 +173,13 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Search some files')
     parser.add_argument('-case', '--case_num', type=int, default=8)
-    parser.add_argument('-config', '--config', type=str, default='./config/config.yaml')
-    parser.add_argument('--remote', action='store_true', default=False, help='train or test model')
+    parser.add_argument('-config', '--config', type=str, default='./config/config_ucr.yaml')
+    parser.add_argument('--remote', action='store_true', default=False, help='train in remote or local')
     args = parser.parse_args()
-    util.set_random_seed(3407)
+    # util.set_random_seed(3407)
     main(args)
     # parser.add_argument('--scale', type=float, default=0.4, help='help')
+    # parser.add_argument('--remote', action='store_true', default=False, help='train or test model')
     # parser.add_argument('--lr', type=float, default=1e-2, help='help')
     # parser.add_argument('-max', '--max_num_iteration', type=int, default=3000, help='help')
     # parser.add_argument('-channel', '--initial_channels', type=int, default=30, help='help')

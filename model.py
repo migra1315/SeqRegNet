@@ -32,6 +32,12 @@ class RegNet(nn.Module):
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.config['learning_rate'], eps=1e-3)
 
     def forward(self, input_image, sample=False):
+        if self.config['forward_type'] == 'zero to N':
+            return self.forward_zero_to_n(input_image, sample)
+        else:
+            return self.forward_i_to_i_plus_1(input_image, sample)
+
+    def forward_zero_to_n(self, input_image, sample=False):
 
         original_image_shape = input_image.shape[2:]
         # input_image: [6, 1, 96, 256, 256]
@@ -49,6 +55,35 @@ class RegNet(nn.Module):
 
         moving_image = input_image[0:1, :, :, :, :].repeat(self.seq_len, 1, 1, 1, 1)
 
+        warped_input_image = self.spatial_transform(moving_image, disp_t2i)
+        # [6, 1, 96, 256, 256] @ [6, 3, 96, 256, 256] = [6, 1, 96, 256, 256]
+
+        scaled_warped_input_image = F.interpolate(warped_input_image, size=scaled_image_shape,
+                                                  mode='bilinear' if self.dim == 2 else 'trilinear',
+                                                  align_corners=True)
+
+        # scaled_warped_input_image: [6, 1, 48, 128, 128]
+        res = {'disp_t2i': disp_t2i, 'scaled_disp_t2i': scaled_disp_t2i, 'warped_input_image': warped_input_image}
+        return res
+
+    def forward_i_to_i_plus_1(self, input_image, sample=False):
+
+        original_image_shape = input_image.shape[2:]
+        # input_image: [6, 1, 96, 256, 256]
+        # 下采样至1/2
+        scaled_image = F.interpolate(input_image, scale_factor=self.scale,
+                                     align_corners=True, mode='bilinear' if self.dim == 2 else 'trilinear',
+                                     recompute_scale_factor=False)  # (1, n, h, w) or (1, n, d, h, w)
+
+        scaled_image_shape = scaled_image.shape[2:]
+        scaled_disp_t2i = self.unet(scaled_image)
+
+        disp_t2i = F.interpolate(scaled_disp_t2i, size=original_image_shape,
+                                 mode='trilinear', align_corners=True)
+        # disp_t2i: [6, 3, 96, 256, 256]
+
+        # moving_image = input_image[0:1, :, :, :, :].repeat(self.seq_len, 1, 1, 1, 1)
+        moving_image = torch.cat([input_image[:1], input_image[:-1]], dim=0)
         warped_input_image = self.spatial_transform(moving_image, disp_t2i)
         # [6, 1, 96, 256, 256] @ [6, 3, 96, 256, 256] = [6, 1, 96, 256, 256]
 

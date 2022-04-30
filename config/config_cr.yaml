@@ -7,7 +7,7 @@ device: 'cuda'
 stop_std: 0.0007
 stop_query_len: 100
 max_num_iteration: 3000
-
+save_file: ''
 # model structure parameters
 scale: 0.8
 dim: 3
