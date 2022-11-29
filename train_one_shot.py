@@ -1,49 +1,45 @@
 import argparse
-import logging
 import os
 import shutil
 import time
 
-import SimpleITK as sitk
 import numpy as np
 import tensorboardX
 import torch
 import tqdm
 import yaml
-from apex import amp
 
 import loss
 import util
 from loss import jacboian_det
 
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+from apex import amp
 
 
 def main(args):
     start_time = "{0}-{1}-{2}".format(str(time.localtime(time.time()).tm_mon), str(time.localtime(time.time()).tm_mday),
                                       str(time.localtime(time.time()).tm_hour))
-    print(f'start in time {start_time} ... \nloading config file {args.config} ...')
+    print(f'\nstart in time {start_time} ... \nloading config file {args.config} ...')
     config = util.get_config(args.config)
     if config['device'] == 'cuda':
         if not torch.cuda.is_available():
             raise ValueError('cuda is not available ...')
 
     print(f'loading image file {args.case_num} with scale {config["scale"]}...')
-    case, input_image, pixel_spacing, grid_tuple, landmark_00_converted, landmark_50_converted \
+    case, input_image, pixel_spacing, grid_tuple, landmark_00_converted, landmark_50_converted, image_shape \
         = util.make_ready(args, config)
 
     print('moving file into specified device...')
     input_image = input_image.to(config['device'])
     print('input size:', input_image.size())
 
-    states_folder = 'result_0430'
+    states_folder = 'result_0627cv'
     os.mkdir(states_folder) if not os.path.exists(states_folder) else None
     index = len([file for file in os.listdir(states_folder) if os.path.isdir(os.path.join(states_folder, file))])
 
     # 初始化训练模型
     regnet = util.init_model(config['model'])(dim=config['dim'], seq_len=len(config['group_index_list']),
                                               config=config, scale=config['scale']).to(config['device'])
-
     if config['apex'] is True:
         print('use apex...')
         regnet, regnet.optimizer = amp.initialize(regnet, regnet.optimizer, opt_level="O1")
@@ -51,25 +47,26 @@ def main(args):
     if config['train']:
         start = time.time()
 
-        states_file = config['model'] + config['save_file'] + f'_case{case}_{index:03d}'
+        states_file = config['model'] + '_' + config['forward_type'] + f'_case{case}_{index:03d}'
         train_writer = tensorboardX.SummaryWriter(os.path.join(states_folder, states_file))
         config_save_path = os.path.join(states_folder, states_file, 'config.yaml')
         shutil.copy(args.config, config_save_path)
+        config_to_save = config.copy()
 
         stop_criterion = util.StopCriterion(stop_std=config['stop_std'], query_len=config['stop_query_len'])
         pbar = tqdm.tqdm(range(config['max_num_iteration']))
         mean_best = float('inf')
-        config_to_save = config.copy()
         for i in pbar:
             simi_loss, smooth_loss, jdet_loss, cyclic_loss, total_loss = regnet.update(input_image)
 
             if i % 50 == 0:
                 res = regnet.forward(input_image, sample=True)
                 # 每隔指定轮数，测试TRE
-                # calTRE = util.CalTRE(grid_tuple, res['disp_t2i'][config['fixed_disp_indexes']])
-                calTRE = util.CalTRE_2(grid_tuple, res['disp_t2i'])
+                cal_tre_func = util.CalTRE_InterFrame(grid_tuple, res['disp_t2i']) \
+                    if config['forward_type'] == 'if' \
+                    else util.CalTRE_Lagrangian(grid_tuple, res['disp_t2i'][config['fixed_disp_indexes']])
 
-                mean, std, diff = calTRE.cal_disp(landmark_00_converted, landmark_50_converted, pixel_spacing)
+                mean, std, diff = cal_tre_func.cal_disp(landmark_00_converted, landmark_50_converted, pixel_spacing)
                 util.write_validation_loss(train_writer, mean, std, i)
                 print(f'\ndiff: {mean:.2f}±{std:.2f}({np.max(diff):.2f})')
 
@@ -92,11 +89,11 @@ def main(args):
 
                     states = {'model': regnet.state_dict()}
                     torch.save(states, os.path.join(states_folder, states_file, 'best.pth'))
-                    logging.info(f'save model state {states_file} of iter {i}')
+                    print(f'save model state {states_file} of iter {i}')
 
-            # stop_criterion.add(simi_loss)
-            # if stop_criterion.stop():
-            #     break
+            stop_criterion.add(simi_loss)
+            if stop_criterion.stop():
+                break
             pbar.set_description(f'{i}, simi. loss {simi_loss:.4f},'
                                  f' smooth loss {smooth_loss:.3f},'
                                  f' jdet loss {jdet_loss:.3f}'
@@ -109,12 +106,13 @@ def main(args):
         print('\ntrain time:', end - start)
 
         res = regnet.forward(input_image, sample=True)
-        # regnet.sample(input_image, os.path.join(states_folder, states_file), 'best', full_sample=True)
+        # regnet.sample(input_image, os.path.join(states_folder, states_file), 'best', full_sample=False)
 
-        # calTRE = util.CalTRE(grid_tuple, res['disp_t2i'][config['fixed_disp_indexes']])
-        calTRE = util.CalTRE_2(grid_tuple, res['disp_t2i'])
+        cal_tre_func = util.CalTRE_InterFrame(grid_tuple, res['disp_t2i']) \
+            if config['forward_type'] == 'if' \
+            else util.CalTRE_Lagrangian(grid_tuple, res['disp_t2i'][config['fixed_disp_indexes']])
 
-        mean, std, diff = calTRE.cal_disp(landmark_00_converted, landmark_50_converted, pixel_spacing)
+        mean, std, diff = cal_tre_func.cal_disp(landmark_00_converted, landmark_50_converted, pixel_spacing)
         print(f'diff: {mean:.2f}±{std:.2f}({np.max(diff):.2f})')
 
         jac_percent, jac_mean = loss.calculate_jac(res['disp_t2i'].detach())
@@ -133,7 +131,7 @@ def main(args):
 
         states = {'model': regnet.state_dict()}
         torch.save(states, os.path.join(states_folder, states_file, 'final.pth'))
-        logging.info(f'save model and optimizer state {states_file}')
+        print(f'save model and optimizer state {states_file}')
 
     else:
         if config['load'] is None:
@@ -143,37 +141,114 @@ def main(args):
         regnet.eval()
         with torch.no_grad():
             res = regnet.forward(input_image, sample=True)
-            save_path, _ = os.path.split(config['load'])
-            regnet.sample(input_image, save_path, 'test', full_sample=True)
-            print('save file into ', save_path)
-
             # print('disp size:', res['disp_t2i'][config['fixed_disp_indexes']].size())
-            # calTRE = util.CalTRE(grid_tuple, res['disp_t2i'][config['fixed_disp_indexes']])
 
-            print('disp size:', res['disp_t2i'].size())
-            calTRE = util.CalTRE_2(grid_tuple, res['disp_t2i'])
+            # save_path, _ = os.path.split(config['load'])
+            # regnet.sample(input_image, save_path, 'test', full_sample=True)
 
-            mean, std, diff = calTRE.cal_disp(landmark_00_converted, landmark_50_converted, pixel_spacing)
+            mean_list = []
+            std_list = []
+            diff_list = []
+            # 300 landmarks
+            cal_tre_func = util.CalTRE_InterFrame(grid_tuple, res['disp_t2i']) \
+                if config['forward_type'] == 'if' \
+                else util.CalTRE_Lagrangian(grid_tuple, res['disp_t2i'][config['fixed_disp_indexes']])
+
+            mean, std, diff = cal_tre_func.cal_disp(landmark_00_converted, landmark_50_converted, pixel_spacing)
+            mean_list.append(mean)
+            std_list.append(std)
+            diff_list.append(diff)
+
+            if False:
+                # 75 landmarks
+                landmark_dict = util.get_test_landmarks_files(args, config, image_shape)
+                cal_tre = util.CalTRE_Lagrangian(grid_tuple, res['disp_t2i'][1])
+                mean, std, diff = cal_tre.cal_disp(landmark_dict['landmark_00'], landmark_dict['landmark_10'],
+                                                   pixel_spacing)
+                mean_list.append(mean)
+                std_list.append(std)
+                diff_list.append(diff)
+
+                cal_tre = util.CalTRE_Lagrangian(grid_tuple, res['disp_t2i'][2])
+                mean, std, diff = cal_tre.cal_disp(landmark_dict['landmark_00'], landmark_dict['landmark_20'],
+                                                   pixel_spacing)
+                mean_list.append(mean)
+                std_list.append(std)
+                diff_list.append(diff)
+
+                cal_tre = util.CalTRE_Lagrangian(grid_tuple, res['disp_t2i'][3])
+                mean, std, diff = cal_tre.cal_disp(landmark_dict['landmark_00'], landmark_dict['landmark_30'],
+                                                   pixel_spacing)
+                mean_list.append(mean)
+                std_list.append(std)
+                diff_list.append(diff)
+
+                cal_tre = util.CalTRE_Lagrangian(grid_tuple, res['disp_t2i'][4])
+                mean, std, diff = cal_tre.cal_disp(landmark_dict['landmark_00'], landmark_dict['landmark_40'],
+                                                   pixel_spacing)
+                mean_list.append(mean)
+                std_list.append(std)
+                diff_list.append(diff)
+
+                cal_tre = util.CalTRE_Lagrangian(grid_tuple, res['disp_t2i'][5])
+                mean, std, diff = cal_tre.cal_disp(landmark_dict['landmark_00'], landmark_dict['landmark_50'],
+                                                   pixel_spacing)
+                mean_list.append(mean)
+                std_list.append(std)
+                diff_list.append(diff)
+
+                cal_tre = util.CalTRE_Lagrangian(grid_tuple, res['disp_t2i'][0])
+                mean, std, diff = cal_tre.cal_disp(landmark_dict['landmark_00'], landmark_dict['landmark_00'],
+                                                   pixel_spacing)
+                mean_list.append(mean)
+                std_list.append(std)
+                diff_list.append(diff)
+
+                test_result = {
+                    'LGF': {'mean': float(format(mean_list[0], ".4f")),
+                            'diff': float(format(np.max(diff_list[0]), ".4f")),
+                            'std': float(format(std_list[0], ".4f"))},
+                    'INF_1': {'mean': float(format(mean_list[1], ".4f")),
+                              'diff': float(format(np.max(diff_list[1]), ".4f")),
+                              'std': float(format(std_list[1], ".4f"))},
+                    'INF_2': {'mean': float(format(mean_list[2], ".4f")),
+                              'diff': float(format(np.max(diff_list[2]), ".4f")),
+                              'std': float(format(std_list[2], ".4f"))},
+                    'INF_3': {'mean': float(format(mean_list[3], ".4f")),
+                              'diff': float(format(np.max(diff_list[3]), ".4f")),
+                              'std': float(format(std_list[3], ".4f"))},
+                    'INF_4': {'mean': float(format(mean_list[4], ".4f")),
+                              'diff': float(format(np.max(diff_list[4]), ".4f")),
+                              'std': float(format(std_list[4], ".4f"))},
+                    'INF_5': {'mean': float(format(mean_list[5], ".4f")),
+                              'diff': float(format(np.max(diff_list[5]), ".4f")),
+                              'std': float(format(std_list[5], ".4f"))}
+                }
+                config_to_save = util.get_config(args.config)
+                config_to_save.update(test_result)
+                with open(args.config, 'w', encoding='utf-8') as f:
+                    yaml.dump(config_to_save, f)
+                for index in range(len(mean_list)):
+                    print(f'diff: {mean_list[index]:.2f}±{std_list[index]:.2f}({np.max(diff_list[index]):.2f})')
+            else:
+                print(f'diff: {mean_list[0]:.2f}±{std_list[0]:.2f}({np.max(diff_list[0]):.2f})')
 
             flow = res['disp_t2i'].detach().cpu()  # .numpy()
             jac = jacboian_det(flow)
-            for index in range(jac.size()[0]):
-                jac_array = jac[index, :, :, :].detach().cpu().numpy()
-                jac_image = sitk.GetImageFromArray(jac_array)
-                jac_image.SetSpacing([0.976, 0.976, 2.5])
-                sitk.WriteImage(jac_image, os.path.join(save_path, f'jac_{index}.nii'))
-
-            jac_percent, jac_mean = loss.calculate_jac(res['disp_t2i'][5:6].detach())
-            print(f'jacobin percent: {jac_percent} %\njacobin Avg.: {jac_mean}')
-
-            print(f'\ndiff: {mean:.2f}+-{std:.2f}({np.max(diff):.2f})')
+            jac_percent, jac_mean = loss.calculate_jac(res['disp_t2i'].detach())
+            print(f'jacobin percent: {jac_percent}, jacobin Avg.: {jac_mean} %')
+            # for index in range(jac.size()[0]):
+            #     jac_array = jac[index, :, :, :].detach().cpu().numpy()
+            #     jac_image = sitk.GetImageFromArray(jac_array)
+            #     jac_image.SetSpacing([0.976, 0.976, 2.5])
+            #     sitk.WriteImage(jac_image, os.path.join(save_path, f'jac_{index}.nii'))
 
 
 # 按间距中的绿色按钮以运行脚本。
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Search some files')
     parser.add_argument('-case', '--case_num', type=int, default=8)
-    parser.add_argument('-config', '--config', type=str, default='./config/config_ucr.yaml')
+    parser.add_argument('-config', '--config', type=str, default='./config/config_fucr.yaml')
     parser.add_argument('--remote', action='store_true', default=False, help='train in remote or local')
     args = parser.parse_args()
     # util.set_random_seed(3407)

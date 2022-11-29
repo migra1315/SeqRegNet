@@ -30,6 +30,10 @@ def init_model(model_name):
         Model = model.RegNet_CR
         print('init model RegNet Cr ...')
 
+    elif model_name == 'bir':
+        Model = model.RegNet_Bir
+        print('init model RegNet Bir ...')
+
     else:
         raise ValueError("model name should be cat or cr")
     return Model
@@ -59,7 +63,37 @@ def make_ready(args, config):
     landmark_50_converted = np.flip(landmark_50, axis=1) - np.array(
         [crop_range[0].start, crop_range[1].start, crop_range[2].start], dtype=np.float32)
 
-    return case, input_image, pixel_spacing, grid_tuple, landmark_00_converted, landmark_50_converted
+    return case, input_image, pixel_spacing, grid_tuple, landmark_00_converted, landmark_50_converted, image_shape
+
+
+def get_test_landmarks_files(args, config, image_shape):
+    case = args.case_num
+    if args.remote:
+        landmark_file = f'/data/JY/Dirlab/landmarks/Case{case}_75.pt'
+    else:
+        landmark_file = f'../DataBase/Dirlab/landmarks/Case{case}_75.pt'
+    crop_range, pixel_spacing = get_case(case)
+    grid_tuple = [np.arange(grid_length, dtype=np.float32) for grid_length in image_shape]
+
+    # 导入标记点，后续计算TRE
+    landmark_info = torch.load(landmark_file)
+    landmark_00_converted = np.flip(landmark_info['landmark_00'], axis=1) - np.array(
+        [crop_range[0].start, crop_range[1].start, crop_range[2].start], dtype=np.float32)
+    landmark_10_converted = np.flip(landmark_info['landmark_10'], axis=1) - np.array(
+        [crop_range[0].start, crop_range[1].start, crop_range[2].start], dtype=np.float32)
+    landmark_20_converted = np.flip(landmark_info['landmark_20'], axis=1) - np.array(
+        [crop_range[0].start, crop_range[1].start, crop_range[2].start], dtype=np.float32)
+    landmark_30_converted = np.flip(landmark_info['landmark_30'], axis=1) - np.array(
+        [crop_range[0].start, crop_range[1].start, crop_range[2].start], dtype=np.float32)
+    landmark_40_converted = np.flip(landmark_info['landmark_40'], axis=1) - np.array(
+        [crop_range[0].start, crop_range[1].start, crop_range[2].start], dtype=np.float32)
+    landmark_50_converted = np.flip(landmark_info['landmark_50'], axis=1) - np.array(
+        [crop_range[0].start, crop_range[1].start, crop_range[2].start], dtype=np.float32)
+
+    landmarks_dict = {'landmark_00': landmark_00_converted, 'landmark_10': landmark_10_converted,
+                      'landmark_20': landmark_20_converted, 'landmark_30': landmark_30_converted,
+                      'landmark_40': landmark_40_converted, 'landmark_50': landmark_50_converted}
+    return landmarks_dict
 
 
 def get_config(config):
@@ -92,12 +126,13 @@ class StopCriterion(object):
             return False
 
 
-class CalTRE:
-    '''
-    pairwise方法
+class CalTRE_Lagrangian:
+    """
+    for 0->N
+    直接送入DVF05，计算TRE
     根据形变场计算配准后的TRE
     构建一个规范网格，及网格上各点的位移场，根据此采样LandMark的形变场
-    '''
+    """
 
     def __init__(self, grid_tuple, disp_f2m):
         self.dim = 3
@@ -108,12 +143,79 @@ class CalTRE:
         正向映射才是我们计算TRE需要的形变场，反映了mving中的点经过形变场后到了哪一个位置
         '''
         disp_m2f = self.inverse_disp(disp_f2m)
-        print(disp_m2f.size())
         '''
         一个采样器，给出一个3维网格，和网格上的数据点 -> 也就是各处的形变场
         '''
         self.inter = interpolate.RegularGridInterpolator(grid_tuple,
                                                          np.moveaxis(disp_m2f.detach().cpu().numpy(), 0, -1))
+
+    def inverse_disp(self, disp, threshold=0.01, max_iteration=20):
+        '''
+        compute the inverse field. implementation of "A simple fixed‐point approach to invert a deformation field"
+
+        disp : (2, h, w) or (3, d, h, w)
+            displacement field
+        '''
+        forward_disp = disp.detach().to(device='cuda')
+        if disp.ndim < self.dim + 2:
+            forward_disp = torch.unsqueeze(forward_disp, 0)
+        backward_disp = torch.zeros_like(forward_disp)
+        backward_disp_old = backward_disp.clone()
+        for i in range(max_iteration):
+            backward_disp = -self.spatial_transformer(forward_disp, backward_disp)
+            diff = torch.max(torch.abs(backward_disp - backward_disp_old)).item()
+            if diff < threshold:
+                break
+            backward_disp_old = backward_disp.clone()
+        if disp.ndim < self.dim + 2:
+            backward_disp = torch.squeeze(backward_disp, 0)
+
+        return backward_disp
+
+    def cal_disp(self, landmark_moving, landmark_fixed, spacing):
+        diff_list = []
+        # gt = np.flip((landmark_fixed[1] - landmark_moving[1]), 0)  # 对应的方向分别为[240,157,83]
+        # pred = self.inter(landmark_moving[1])
+
+        for i in range(landmark_moving.shape[0]):
+            # landmark_moving[i]处的推理形变场pred
+            # landmark_moving[i]处的真实形变场gt
+            pred = self.inter(landmark_moving[i])
+            gt = np.flip((landmark_fixed[i] - landmark_moving[i]), 0)  # 对应的方向分别为[240,157,83]
+            diff_list.append(pred - gt)
+        diff_voxel = np.array(diff_list).squeeze(1)
+        # 计算300个点对的欧氏距离
+        diff = (np.sum((diff_voxel * spacing) ** 2, 1)) ** 0.5
+        return np.mean(diff), np.std(diff), diff
+
+
+class CalTRE_InterFrame:
+    """
+    for M->N
+        grid_tuple 与形变场大小一致的规则网格，用于
+        disp_f2m   根据 DVF00,01,12,23,34,45 生成DVF05, 计算形变场
+    """
+
+    def __init__(self, grid_tuple, disp_f2m):
+        self.dim = 3
+        self.spatial_transformer = model.SpatialTransformer(dim=self.dim)
+
+        disp01 = self.spatial_transformer(disp_f2m[0:1], disp_f2m[1:2]) + disp_f2m[1:2]  # (n, 3, d, h, w)
+        disp02 = self.spatial_transformer(disp01, disp_f2m[2:3]) + disp_f2m[2:3]  # (n, 3, d, h, w)
+        disp03 = self.spatial_transformer(disp02, disp_f2m[3:4]) + disp_f2m[3:4]  # (n, 3, d, h, w)
+        disp04 = self.spatial_transformer(disp03, disp_f2m[4:5]) + disp_f2m[4:5]  # (n, 3, d, h, w)
+        disp05 = self.spatial_transformer(disp04, disp_f2m[5:6]) + disp_f2m[5:6]  # (n, 3, d, h, w)
+        '''
+        STN网络中用到的都是反向映射，即warpped中(x,y,z)处的点来自moving的哪一处
+        WARPPED_INT(x,y,x) = MVOING_INT(x-disp_x, y-disp_y, z-disp_z)
+        正向映射才是我们计算TRE需要的形变场，反映了mving中的点经过形变场后到了哪一个位置
+        '''
+        disp_m2f = self.inverse_disp(disp05)
+        '''
+        一个采样器，给出一个3维网格，和网格上的数据点 -> 也就是各处的形变场
+        '''
+        self.inter = interpolate.RegularGridInterpolator(grid_tuple,
+                                                         np.moveaxis(disp_m2f.squeeze(0).detach().cpu().numpy(), 0, -1))
 
     def inverse_disp(self, disp, threshold=0.01, max_iteration=20):
         '''
@@ -155,22 +257,19 @@ class CalTRE:
         return np.mean(diff), np.std(diff), diff
 
 
-class CalTRE_2:
+class CalTRE_3:
     """
-    :param
-        grid_tuple 与形变场大小一致的规则网格，用于
-        disp_f2m
-    :return
+   for 0->3, 3->5
     """
 
     def __init__(self, grid_tuple, disp_f2m):
         self.dim = 3
         self.spatial_transformer = model.SpatialTransformer(dim=self.dim)
 
-        disp05 = self.spatial_transformer(disp_f2m[1:2], disp_f2m[2:3]) + disp_f2m[2:3]  # (n, 3, d, h, w)
-        disp05 = self.spatial_transformer(disp05, disp_f2m[3:4]) + disp_f2m[3:4]  # (n, 3, d, h, w)
-        disp05 = self.spatial_transformer(disp05, disp_f2m[4:5]) + disp_f2m[4:5]  # (n, 3, d, h, w)
-        disp05 = self.spatial_transformer(disp05, disp_f2m[5:6]) + disp_f2m[5:6]  # (n, 3, d, h, w)
+        # disp03=disp_f2m[3:4]
+        # disp35=disp_f2m[6:7]
+        disp05 = self.spatial_transformer(disp_f2m[3:4], disp_f2m[6:7]) + disp_f2m[6:7]  # (n, 3, d, h, w)
+
         '''
         STN网络中用到的都是反向映射，即warpped中(x,y,z)处的点来自moving的哪一处
         WARPPED_INT(x,y,x) = MVOING_INT(x-disp_x, y-disp_y, z-disp_z)
@@ -276,9 +375,9 @@ def load_data(data_folder, crop_range):
                   image_file_list]
     input_image = torch.stack([torch.from_numpy(image)[None] for image in image_list], 0)
     input_image = input_image[:, :, crop_range[0], crop_range[1], crop_range[2]]
-    input_image = (input_image - input_image.min()) / (input_image.max() - input_image.min())
     num_image = input_image.shape[0]  # number of image in the group
     image_shape = input_image.size()[2:]
+    input_image = (input_image - input_image.min()) / (input_image.max() - input_image.min())
     return input_image, image_shape, num_image
 
 
